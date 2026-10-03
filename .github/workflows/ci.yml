@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Compile modules
+        run: python -m compileall -q app scripts
+      - name: Check critical Python lint
+        run: ruff check app tests scripts --select E4,E7,E9,F
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Verify Docker image builds
+        run: docker build -t document-intelligence-platform:ci .

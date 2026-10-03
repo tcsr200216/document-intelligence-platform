@@ -1,0 +1,7 @@
+# Example architecture notes
+
+PostgreSQL stores durable document metadata and citation spans in SQL transactions.
+Every normalized chunk retains its source document identifier and character offsets.
+The current local vector index is process-local, so vector search does not survive restart.
+A later pgvector adapter can persist and search embeddings alongside document records.
+The hashing embedder is deterministic and supports token overlap; it is not semantic search.
