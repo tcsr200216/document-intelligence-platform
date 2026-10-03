@@ -2,22 +2,26 @@
 
 A Python/FastAPI document ingestion and retrieval service. The currently implemented
 path is **upload → UTF-8 text/Markdown parsing → deterministic overlapping chunks →
-local embeddings → indexed cosine search**. Chunk text and source offsets are also
+pluggable embeddings → indexed cosine search**. Chunk text and source offsets are also
 stored in a repository adapter (in memory or PostgreSQL). This is an evolving
-portfolio project: a true semantic provider, durable vector backend, PDF extraction,
-and grounded answer generation are future milestones, **not current capabilities**.
+portfolio project: OpenAI-compatible semantic embeddings are available through
+environment configuration, while the deterministic hashing provider remains the
+key-free local default. Durable vector storage, PDF extraction, and grounded answer
+generation are future milestones, **not current capabilities**.
 
 ## Architecture
 
 ```text
 HTTP upload -> validate -> parse text -> chunk with exact source offsets
-                                    -> HashingEmbedder -> InMemoryVectorStore
+                                    -> Embedder (hashing or OpenAI) -> InMemoryVectorStore
                                     -> DocumentRepository (memory or PostgreSQL)
 HTTP search -> embed query -> rank chunks -> return document, chunk, score and source offsets
 ```
 
 See `docs/architecture/` for the recorded decisions and tradeoffs. The current
 hashing embedder measures deterministic token overlap, not semantic similarity.
+The OpenAI adapter performs real remote semantic embedding with strict response
+dimension, index, and numeric validation. Provider/model details appear in `/ready`.
 With PostgreSQL configured, document metadata and chunk provenance survive restarts,
 but the *vector index does not*: re-upload is required for search until a durable
 vector adapter or index rebuild path is added.
@@ -43,6 +47,25 @@ python -m pytest -q
 Open http://localhost:8000/docs for interactive API documentation.
 The smoke script uploads `data/sample_document.txt`, fetches its metadata, and
 performs a document-scoped search. It exits nonzero if any step fails.
+
+### Use semantic embeddings
+
+Hashing is the default so local runs and CI need no secret. To use an
+OpenAI-compatible semantic provider, set the following in `.env` before starting
+the API:
+
+```bash
+EMBEDDING_PROVIDER=openai
+EMBEDDING_DIMENSIONS=1536
+OPENAI_API_KEY=your-key-from-a-secret-manager
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+```
+
+`OPENAI_BASE_URL` can point to a compatible gateway. The service fails at startup
+if `openai` is selected without a key, and remote errors fail the request rather
+than silently switching models. Never mix embeddings from different models in one
+index; restart with an empty/rebuilt vector index after changing provider, model,
+or dimensions. See [ADR-006](docs/architecture/ADR-006-semantic-embedding-provider.md).
 
 ### Run with Docker and PostgreSQL
 

@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-import app.main as main
+from app import main
 from app.embeddings import HashingEmbedder
 from app.repository import InMemoryDocumentRepository
 from app.vector_store import InMemoryVectorStore
@@ -84,6 +84,8 @@ def test_ready_reports_embedding_store_and_metadata_configuration(monkeypatch) -
     assert response.status_code == 200
     assert response.json() == {
         "status": "ready",
+        "embedding_provider": "hashing",
+        "embedding_model": "sha256-token-hashing-v1-64d",
         "embedding_dimensions": 64,
         "vector_store": "memory",
         "document_store": "memory",

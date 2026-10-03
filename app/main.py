@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Annotated
 from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.embeddings import HashingEmbedder
+from app.embeddings import build_embedder
 from app.parsing import DocumentParseError, chunk_text, parse_text_document
 from app.repository import DocumentRecord, DocumentRepository, build_document_repository
 from app.vector_store import InMemoryVectorStore
@@ -18,7 +19,16 @@ MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md"}
 SUPPORTED_CONTENT_TYPES = {"application/pdf", "text/plain", "text/markdown"}
 
-embedder = HashingEmbedder()
+embedder = build_embedder(
+    provider=settings.embedding_provider,
+    dimensions=settings.embedding_dimensions,
+    openai_api_key=(
+        settings.openai_api_key.get_secret_value() if settings.openai_api_key else None
+    ),
+    openai_model=settings.openai_embedding_model,
+    openai_base_url=settings.openai_base_url,
+    timeout_seconds=settings.embedding_timeout_seconds,
+)
 vector_store = InMemoryVectorStore(dimensions=embedder.dimensions)
 document_repository: DocumentRepository = build_document_repository(settings.database_url)
 
@@ -81,6 +91,8 @@ async def ready() -> dict[str, str | int]:
         raise HTTPException(status_code=503, detail="Document repository is unavailable.")
     return {
         "status": "ready",
+        "embedding_provider": embedder.provider,
+        "embedding_model": embedder.model_version,
         "embedding_dimensions": embedder.dimensions,
         "vector_store": "memory",
         "document_store": document_repository.backend,
@@ -98,7 +110,7 @@ async def root() -> dict[str, str]:
     status_code=201,
     tags=["documents"],
 )
-async def upload_document(file: UploadFile = File(...)) -> DocumentUploadResponse:
+async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUploadResponse:
     """Parse, chunk, embed, index, and persist traceable document metadata."""
     filename = file.filename or "unnamed"
     extension = Path(filename).suffix.lower()

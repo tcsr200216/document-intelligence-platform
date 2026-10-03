@@ -1,8 +1,14 @@
 import math
 
+import httpx
 import pytest
 
-from app.embeddings import HashingEmbedder
+from app.embeddings import (
+    EmbeddingProviderError,
+    HashingEmbedder,
+    OpenAIEmbedder,
+    build_embedder,
+)
 
 
 def test_hashing_embedder_is_deterministic() -> None:
@@ -42,3 +48,75 @@ def test_hashing_embedder_preserves_batch_order() -> None:
 def test_hashing_embedder_rejects_non_positive_dimensions() -> None:
     with pytest.raises(ValueError, match="greater than zero"):
         HashingEmbedder(dimensions=0)
+
+
+def test_openai_embedder_sends_batch_and_restores_provider_order() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://embeddings.example/v1/embeddings"
+        assert request.headers["Authorization"] == "Bearer test-key"
+        assert request.read().decode() == (
+            '{"input":["first","second"],"model":"semantic-test","dimensions":3}'
+        )
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"index": 1, "embedding": [0.0, 1.0, 0.0]},
+                    {"index": 0, "embedding": [1.0, 0.0, 0.0]},
+                ]
+            },
+        )
+
+    embedder = OpenAIEmbedder(
+        api_key="test-key",
+        model="semantic-test",
+        dimensions=3,
+        base_url="https://embeddings.example/v1/",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert embedder.provider == "openai"
+    assert embedder.model_version == "semantic-test-3d"
+    assert embedder.embed(["first", "second"]) == [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ]
+
+
+def test_openai_embedder_rejects_wrong_dimensions() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": [1.0, 2.0]}]}
+        )
+    )
+    embedder = OpenAIEmbedder(
+        api_key="test-key",
+        dimensions=3,
+        client=httpx.Client(transport=transport),
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="dimensions"):
+        embedder.embed(["valid text"])
+
+
+def test_openai_embedder_wraps_remote_failure_without_exposing_response() -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(429, text="sensitive body"))
+    embedder = OpenAIEmbedder(
+        api_key="test-key",
+        dimensions=3,
+        client=httpx.Client(transport=transport),
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="Remote embedding request failed") as error:
+        embedder.embed(["valid text"])
+
+    assert "sensitive body" not in str(error.value)
+
+
+def test_builder_keeps_hashing_default_and_requires_key_for_openai() -> None:
+    local = build_embedder(provider="hashing", dimensions=32)
+
+    assert isinstance(local, HashingEmbedder)
+    assert local.model_version == "sha256-token-hashing-v1-32d"
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        build_embedder(provider="openai", dimensions=32)
