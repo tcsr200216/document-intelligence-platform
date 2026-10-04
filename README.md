@@ -30,6 +30,13 @@ through an HNSW index for vectors up to 2,000 dimensions (and an exact database
 scan above that limit). It refuses startup if the configured embedding model or
 dimensions differ from the durable index contract.
 
+Every response includes a generated `X-Request-ID`, and the service emits one
+structured completion log per request. Prometheus metrics at `/metrics` cover HTTP
+traffic and latency, ingestion stages and duration, chunk counts, retrieval outcomes,
+result counts, and grounded-answer outcomes. Labels use route templates, document
+format, operation, provider, and finite outcome values; filenames, document IDs,
+questions, chunk text, and exception messages are never labels.
+
 ## Run locally
 
 Requires **Python 3.12+**. With no `DATABASE_URL`, no external services are needed:
@@ -148,9 +155,9 @@ The provided `Dockerfile` and `compose.yaml` support a single-host container
 deployment (for example on a Linux VM). Set a **private production PostgreSQL**
 instance with the pgvector extension and supply `DATABASE_URL` securely to the
 container; do not publish PostgreSQL to the Internet or reuse the Compose demo
-password. Configure HTTPS
-and authentication at a trusted reverse proxy, set resource/upload limits,
-and monitor `/health` and `/ready`. PostgreSQL-backed vectors are shared across API
+password. Configure HTTPS and authentication at a trusted reverse proxy, set
+resource/upload limits, monitor `/health` and `/ready`, and scrape `/metrics` only
+from a private monitoring network. PostgreSQL-backed vectors are shared across API
 replicas; the no-database fallback remains process-local and is intended for
 development.
 
@@ -160,3 +167,14 @@ Then use the smoke test against the mapped HTTP endpoint (prefer an authenticate
 HTTPS reverse proxy for remote access). Consult `docs/architecture/` before
 scaling: managed migrations, authentication, OCR, and background ingestion remain
 future production work.
+
+## Operations and observability
+
+Use `/health` for process liveness, `/ready` for dependency and embedding-contract
+readiness, and `/metrics` for Prometheus scraping. A minimal alerting policy should
+watch readiness failures, non-2xx request rates, ingestion stage errors, provider
+errors, and latency percentiles. Correlate a client-visible `X-Request-ID` with the
+JSON request-completion log when investigating a failure. Metrics deliberately avoid
+raw paths and source identifiers, but the endpoint should still remain private because
+operational traffic patterns may be sensitive. See
+[ADR-010](docs/architecture/ADR-010-bounded-cardinality-observability.md).

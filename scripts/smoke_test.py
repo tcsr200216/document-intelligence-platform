@@ -100,6 +100,7 @@ def main() -> None:
         health = client.get("/health")
         health.raise_for_status()
         assert health.json()["status"] == "ok"
+        assert health.headers.get("X-Request-ID")
 
         ready = client.get("/ready")
         ready.raise_for_status()
@@ -123,6 +124,12 @@ def main() -> None:
                 args.document_id_output.write_text(document_id + "\n")
 
         hit_count, citation_count = verify_document(client, document_id, sample)
+
+        metrics = client.get("/metrics")
+        metrics.raise_for_status()
+        assert "document_intelligence_http_requests_total" in metrics.text
+        assert "document_intelligence_ingestion_stages_total" in metrics.text
+        assert document_id not in metrics.text
 
     print(
         f"Smoke test passed: document {document_id}, "

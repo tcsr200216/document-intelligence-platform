@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -8,10 +9,21 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.answering import AnswerProviderError, AnswerStatus, build_answer_generator
 from app.config import settings
-from app.embeddings import build_embedder
+from app.embeddings import EmbeddingProviderError, build_embedder
+from app.observability import (
+    ANSWER_OUTCOMES,
+    INGESTED_CHUNKS,
+    INGESTION_DURATION,
+    INGESTION_STAGES,
+    RETRIEVAL_REQUESTS,
+    RETRIEVAL_RESULTS,
+    HttpObservabilityMiddleware,
+    metrics_response,
+)
 from app.parsing import DocumentParseError, chunk_document, parse_document
 from app.repository import DocumentRecord, DocumentRepository, build_document_repository
 from app.vector_store import build_vector_store
@@ -117,6 +129,7 @@ app = FastAPI(
     version="0.1.0",
     description="Production-oriented document ingestion and retrieval API.",
 )
+app.add_middleware(HttpObservabilityMiddleware)
 
 
 @app.get("/health", tags=["system"])
@@ -148,6 +161,11 @@ async def root() -> dict[str, str]:
     return {"service": "document-intelligence-platform", "status": "running"}
 
 
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    return metrics_response()
+
+
 @app.post(
     "/documents/upload",
     response_model=DocumentUploadResponse,
@@ -159,6 +177,8 @@ async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUpl
     filename = file.filename or "unnamed"
     extension = Path(filename).suffix.lower()
     content_type = (file.content_type or "").lower()
+    document_format = extension.removeprefix(".") or "unknown"
+    started = time.perf_counter()
 
     if extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
@@ -177,29 +197,49 @@ async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUpl
     try:
         parsed = parse_document(filename, payload)
     except DocumentParseError as exc:
+        INGESTION_STAGES.labels("parse", "error", document_format).inc()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    INGESTION_STAGES.labels("parse", "success", document_format).inc()
 
     chunks = chunk_document(parsed)
-    vectors = embedder.embed([chunk.text for chunk in chunks])
+    try:
+        vectors = embedder.embed([chunk.text for chunk in chunks])
+    except EmbeddingProviderError as exc:
+        INGESTION_STAGES.labels("embed", "error", document_format).inc()
+        raise HTTPException(status_code=503, detail="Embedding provider is unavailable.") from exc
+    INGESTION_STAGES.labels("embed", "success", document_format).inc()
     document_id = str(uuid4())
     uploaded_at = datetime.now(UTC)
     sha256 = hashlib.sha256(payload).hexdigest()
 
     # Persist the citation source before publishing it to the retriever. A
     # successful search result therefore always has durable metadata when SQL is configured.
-    document_repository.save(
-        DocumentRecord(
-            document_id=document_id,
-            filename=filename,
-            content_type=content_type or "application/octet-stream",
-            size_bytes=len(payload),
-            sha256=sha256,
-            uploaded_at=uploaded_at,
-            character_count=parsed.character_count,
-            chunks=tuple(chunks),
+    try:
+        document_repository.save(
+            DocumentRecord(
+                document_id=document_id,
+                filename=filename,
+                content_type=content_type or "application/octet-stream",
+                size_bytes=len(payload),
+                sha256=sha256,
+                uploaded_at=uploaded_at,
+                character_count=parsed.character_count,
+                chunks=tuple(chunks),
+            )
         )
-    )
-    vector_store.replace_document(document_id, chunks, vectors)
+    except SQLAlchemyError as exc:
+        INGESTION_STAGES.labels("persist", "error", document_format).inc()
+        raise HTTPException(status_code=503, detail="Document repository is unavailable.") from exc
+    INGESTION_STAGES.labels("persist", "success", document_format).inc()
+    try:
+        vector_store.replace_document(document_id, chunks, vectors)
+    except SQLAlchemyError as exc:
+        INGESTION_STAGES.labels("index", "error", document_format).inc()
+        raise HTTPException(status_code=503, detail="Vector store is unavailable.") from exc
+    INGESTION_STAGES.labels("index", "success", document_format).inc()
+    INGESTION_STAGES.labels("completed", "success", document_format).inc()
+    INGESTION_DURATION.labels(document_format).observe(time.perf_counter() - started)
+    INGESTED_CHUNKS.labels(document_format).observe(len(chunks))
 
     return DocumentUploadResponse(
         document_id=document_id,
@@ -240,10 +280,20 @@ async def search_documents(request: SearchRequest) -> list[SearchResult]:
     if not request.query.strip():
         raise HTTPException(status_code=422, detail="Search query must contain readable text.")
 
-    query_vector = embedder.embed([request.query])[0]
-    hits = vector_store.search(
-        query_vector, limit=request.limit, document_id=request.document_id
-    )
+    try:
+        query_vector = embedder.embed([request.query])[0]
+    except EmbeddingProviderError as exc:
+        RETRIEVAL_REQUESTS.labels("search", "embedding_error").inc()
+        raise HTTPException(status_code=503, detail="Embedding provider is unavailable.") from exc
+    try:
+        hits = vector_store.search(
+            query_vector, limit=request.limit, document_id=request.document_id
+        )
+    except SQLAlchemyError as exc:
+        RETRIEVAL_REQUESTS.labels("search", "backend_error").inc()
+        raise HTTPException(status_code=503, detail="Vector store is unavailable.") from exc
+    RETRIEVAL_REQUESTS.labels("search", "success").inc()
+    RETRIEVAL_RESULTS.labels("search").observe(len(hits))
     return [
         SearchResult(
             document_id=hit.document_id,
@@ -265,16 +315,30 @@ async def answer_question(request: QuestionRequest) -> QuestionResponse:
     if not request.question.strip():
         raise HTTPException(status_code=422, detail="Question must contain readable text.")
 
-    query_vector = embedder.embed([request.question])[0]
-    hits = vector_store.search(
-        query_vector,
-        limit=request.context_limit,
-        document_id=request.document_id,
-    )
+    try:
+        query_vector = embedder.embed([request.question])[0]
+    except EmbeddingProviderError as exc:
+        RETRIEVAL_REQUESTS.labels("question", "embedding_error").inc()
+        ANSWER_OUTCOMES.labels(answer_generator.provider, "provider_error").inc()
+        raise HTTPException(status_code=503, detail="Embedding provider is unavailable.") from exc
+    try:
+        hits = vector_store.search(
+            query_vector,
+            limit=request.context_limit,
+            document_id=request.document_id,
+        )
+    except SQLAlchemyError as exc:
+        RETRIEVAL_REQUESTS.labels("question", "backend_error").inc()
+        ANSWER_OUTCOMES.labels(answer_generator.provider, "retrieval_error").inc()
+        raise HTTPException(status_code=503, detail="Vector store is unavailable.") from exc
+    RETRIEVAL_REQUESTS.labels("question", "success").inc()
+    RETRIEVAL_RESULTS.labels("question").observe(len(hits))
     try:
         generated = answer_generator.generate(request.question, hits)
     except AnswerProviderError as exc:
+        ANSWER_OUTCOMES.labels(answer_generator.provider, "provider_error").inc()
         raise HTTPException(status_code=503, detail="Answer provider is unavailable.") from exc
+    ANSWER_OUTCOMES.labels(answer_generator.provider, generated.status).inc()
 
     citations = [
         CitationResponse(

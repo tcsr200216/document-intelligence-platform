@@ -1,5 +1,9 @@
+import json
+from uuid import UUID, uuid4
+
 from conftest import build_text_pdf
 from fastapi.testclient import TestClient
+from prometheus_client.parser import text_string_to_metric_families
 
 from app import main
 from app.answering import ExtractiveAnswerGenerator
@@ -210,3 +214,85 @@ def test_question_answer_abstains_without_indexed_context(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "insufficient_context"
     assert response.json()["citations"] == []
+
+
+def test_requests_include_correlation_id_and_metrics_use_route_templates(
+    monkeypatch, caplog
+) -> None:
+    client = fresh_client(monkeypatch)
+    unknown_document_id = str(uuid4())
+
+    response = client.get(f"/documents/{unknown_document_id}")
+    metrics = client.get("/metrics")
+
+    assert response.status_code == 404
+    UUID(response.headers["X-Request-ID"])
+    assert metrics.status_code == 200
+    assert metrics.headers["content-type"].startswith("text/plain")
+    assert unknown_document_id not in metrics.text
+    completion_logs = [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "document_intelligence.http"
+    ]
+    document_log = next(
+        item for item in completion_logs if item["route"] == "/documents/{document_id}"
+    )
+    assert document_log["request_id"] == response.headers["X-Request-ID"]
+    assert document_log["status"] == 404
+    assert unknown_document_id not in json.dumps(completion_logs)
+    families = {
+        family.name: family for family in text_string_to_metric_families(metrics.text)
+    }
+    samples = families["document_intelligence_http_requests"].samples
+    assert any(
+        sample.labels
+        == {
+            "method": "GET",
+            "route": "/documents/{document_id}",
+            "status_class": "4xx",
+        }
+        and sample.value >= 1
+        for sample in samples
+        if sample.name == "document_intelligence_http_requests_total"
+    )
+
+
+def test_pipeline_metrics_report_formats_stages_retrieval_and_answer_status(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+    document = client.post(
+        "/documents/upload",
+        files={"file": ("metrics.txt", b"PostgreSQL stores citation spans.", "text/plain")},
+    ).json()
+    client.post(
+        "/search",
+        json={"query": "citation spans", "document_id": document["document_id"]},
+    ).raise_for_status()
+    client.post(
+        "/questions",
+        json={
+            "question": "Where are citation spans stored?",
+            "document_id": document["document_id"],
+        },
+    ).raise_for_status()
+
+    metrics = client.get("/metrics").text
+
+    assert 'document_intelligence_ingestion_stages_total{format="txt",outcome="success",stage="completed"}' in metrics
+    assert 'document_intelligence_retrieval_requests_total{operation="search",outcome="success"}' in metrics
+    assert 'document_intelligence_retrieval_requests_total{operation="question",outcome="success"}' in metrics
+    assert 'document_intelligence_answer_outcomes_total{provider="extractive",status="answered"}' in metrics
+
+
+def test_parse_failure_is_observable_without_document_identity(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("private-name.txt", b"prefix\xff", "text/plain")},
+    )
+    metrics = client.get("/metrics").text
+
+    assert response.status_code == 422
+    assert 'document_intelligence_ingestion_stages_total{format="txt",outcome="error",stage="parse"}' in metrics
+    assert "private-name.txt" not in metrics
