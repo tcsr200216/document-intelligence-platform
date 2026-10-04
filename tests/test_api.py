@@ -1,3 +1,4 @@
+from conftest import build_text_pdf
 from fastapi.testclient import TestClient
 
 from app import main
@@ -114,14 +115,39 @@ def test_get_document_returns_404_for_unknown_id(monkeypatch) -> None:
     assert response.status_code == 404
 
 
-def test_upload_rejects_pdf_until_extraction_is_implemented(monkeypatch) -> None:
+def test_pdf_upload_enters_retrieval_and_cited_question_flow(monkeypatch) -> None:
     client = fresh_client(monkeypatch)
-    response = client.post(
+    upload = client.post(
         "/documents/upload",
-        files={"file": ("report.pdf", b"%PDF-test", "application/pdf")},
+        files={
+            "file": (
+                "report.pdf",
+                build_text_pdf(
+                    "PostgreSQL stores durable document metadata.",
+                    "Citations retain page-aware source offsets.",
+                ),
+                "application/pdf",
+            )
+        },
     )
-    assert response.status_code == 501
-    assert "not implemented" in response.json()["detail"]
+    assert upload.status_code == 201
+    document_id = upload.json()["document_id"]
+
+    search = client.post(
+        "/search",
+        json={"query": "Where is durable metadata stored?", "document_id": document_id},
+    )
+    assert search.status_code == 200
+    assert {hit["page_start"] for hit in search.json()} == {1, 2}
+    assert all(hit["page_start"] == hit["page_end"] for hit in search.json())
+
+    question = client.post(
+        "/questions",
+        json={"question": "Where is durable metadata stored?", "document_id": document_id},
+    )
+    assert question.status_code == 200
+    assert question.json()["status"] == "answered"
+    assert question.json()["citations"][0]["page_start"] in {1, 2}
 
 
 def test_upload_surfaces_invalid_utf8_as_unprocessable_document(monkeypatch) -> None:
@@ -169,6 +195,8 @@ def test_question_answer_returns_exact_traceable_citation(monkeypatch) -> None:
             "text": payload.decode(),
             "start_char": 0,
             "end_char": len(payload.decode()),
+            "page_start": None,
+            "page_end": None,
             "score": body["citations"][0]["score"],
         }
     ]

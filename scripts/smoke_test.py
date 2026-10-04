@@ -7,15 +7,51 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from io import BytesIO
 from pathlib import Path
 
 import httpx
+from pypdf import PdfWriter
+from pypdf.generic import DictionaryObject, NameObject, StreamObject
 
 
-def verify_document(client: httpx.Client, document_id: str, sample: Path) -> tuple[int, int]:
+def build_sample_pdf() -> bytes:
+    writer = PdfWriter()
+    for text in (
+        "PostgreSQL stores durable document metadata and citation spans.",
+        "Pgvector provides durable semantic retrieval across API restarts.",
+    ):
+        page = writer.add_blank_page(width=612, height=792)
+        font_reference = writer._add_object(
+            DictionaryObject(
+                {
+                    NameObject("/Type"): NameObject("/Font"),
+                    NameObject("/Subtype"): NameObject("/Type1"),
+                    NameObject("/BaseFont"): NameObject("/Helvetica"),
+                }
+            )
+        )
+        page[NameObject("/Resources")] = DictionaryObject(
+            {
+                NameObject("/Font"): DictionaryObject(
+                    {NameObject("/F1"): font_reference}
+                )
+            }
+        )
+        stream = StreamObject()
+        stream.set_data(f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("ascii"))
+        page[NameObject("/Contents")] = writer._add_object(stream)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def verify_document(
+    client: httpx.Client, document_id: str, sample: bytes
+) -> tuple[int, int]:
     detail = client.get(f"/documents/{document_id}")
     detail.raise_for_status()
-    assert detail.json()["sha256"] == hashlib.sha256(sample.read_bytes()).hexdigest()
+    assert detail.json()["sha256"] == hashlib.sha256(sample).hexdigest()
 
     response = client.post(
         "/search",
@@ -29,6 +65,7 @@ def verify_document(client: httpx.Client, document_id: str, sample: Path) -> tup
     hits = response.json()
     assert hits and all(hit["document_id"] == document_id for hit in hits)
     assert all(0 <= hit["start_char"] < hit["end_char"] and hit["text"] for hit in hits)
+    assert all(hit["page_start"] == hit["page_end"] in {1, 2} for hit in hits)
 
     question = client.post(
         "/questions",
@@ -46,6 +83,7 @@ def verify_document(client: httpx.Client, document_id: str, sample: Path) -> tup
         citation["document_id"] == document_id
         and 0 <= citation["start_char"] < citation["end_char"]
         and citation["text"]
+        and citation["page_start"] == citation["page_end"] in {1, 2}
         for citation in answer["citations"]
     )
     return len(hits), len(answer["citations"])
@@ -57,7 +95,7 @@ def main() -> None:
     parser.add_argument("--document-id-output", type=Path)
     parser.add_argument("--verify-document-id-file", type=Path)
     args = parser.parse_args()
-    sample = Path(__file__).resolve().parents[1] / "data" / "sample_document.txt"
+    sample = build_sample_pdf()
     with httpx.Client(base_url=args.base_url.rstrip("/"), timeout=15.0) as client:
         health = client.get("/health")
         health.raise_for_status()
@@ -74,7 +112,7 @@ def main() -> None:
         else:
             upload = client.post(
                 "/documents/upload",
-                files={"file": ("sample_document.txt", sample.read_bytes(), "text/plain")},
+                files={"file": ("sample_document.pdf", sample, "application/pdf")},
             )
             upload.raise_for_status()
             document = upload.json()

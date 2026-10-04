@@ -1,19 +1,19 @@
 # Document Intelligence Platform
 
 A Python/FastAPI document ingestion and retrieval service. The currently implemented
-path is **upload → UTF-8 text/Markdown parsing → deterministic overlapping chunks →
+path is **upload → text/Markdown or page-aware PDF parsing → deterministic chunks →
 pluggable embeddings → indexed cosine search**. Chunk text, source offsets, and
 vectors are stored behind repository adapters (in memory or PostgreSQL/pgvector).
 This is an evolving portfolio project: OpenAI-compatible semantic embeddings are available through
 environment configuration, while the deterministic hashing provider remains the
 key-free local default. Citation-backed Q&A is available through a deterministic
-extractive baseline or an OpenAI-compatible grounded generator. PDF extraction is a
-future milestone, **not a current capability**.
+extractive baseline or an OpenAI-compatible grounded generator. Text-based PDFs are
+extracted locally; scanned/image-only PDFs fail clearly because OCR is not enabled.
 
 ## Architecture
 
 ```text
-HTTP upload -> validate -> parse text -> chunk with exact source offsets
+HTTP upload -> validate -> parse text/PDF -> page-bounded chunks with exact offsets
                                     -> Embedder -> VectorStore (memory or pgvector)
                                     -> DocumentRepository (memory or PostgreSQL)
 HTTP search -> embed query -> rank chunks -> return document, chunk, score and source offsets
@@ -49,8 +49,9 @@ python -m pytest -q
 ```
 
 Open http://localhost:8000/docs for interactive API documentation.
-The smoke script uploads `data/sample_document.txt`, fetches its metadata, and
-performs a document-scoped search. It exits nonzero if any step fails.
+The smoke script builds and uploads a real two-page text PDF, fetches its metadata,
+and exercises document-scoped search and citation-backed Q&A. It exits nonzero if
+any step fails.
 
 ### Use semantic embeddings
 
@@ -86,7 +87,8 @@ curl -fsS -X POST http://localhost:8000/questions \
 ```
 
 The response includes answer status, provider, and citations containing the exact
-document ID, chunk index, chunk text, cosine score, and source character offsets.
+document ID, chunk index, chunk text, cosine score, normalized source character
+offsets, and PDF page range when applicable.
 When context is absent or below the configured relevance threshold, the service
 returns `insufficient_context` with no citations. See
 [ADR-007](docs/architecture/ADR-007-citation-backed-question-answering.md).
@@ -125,17 +127,20 @@ curl -fsS -X POST http://localhost:8000/search \
   -d '{"query":"Where is metadata stored?","document_id":"YOUR_DOCUMENT_ID","limit":3}'
 ```
 
-Supported formats are `.txt` and `.md` with UTF-8 text (up to 10 MB).
-PDF upload returns an explicit 501 until extraction is implemented.
+Supported formats are UTF-8 `.txt`/`.md` and text-based `.pdf` files up to 10 MB.
+PDF chunks never cross page boundaries, and citations include one-based page numbers.
+The parser does not perform OCR; scanned/image-only and password-protected PDFs return
+an explicit validation error instead of being indexed as empty content. See
+[ADR-009](docs/architecture/ADR-009-page-aware-pdf-ingestion.md).
 
 ## Tests and CI
 
 `python -m pytest -q` covers parsing, chunking, embeddings, source provenance,
 vector retrieval, repository storage, and HTTP ingestion/search. The GitHub Actions
 workflow compiles Python sources, runs lint and tests, builds the image, launches the
-API with PostgreSQL/pgvector, and runs the complete upload → persistence → retrieval →
-cited Q&A flow before and after an API restart. CI passing does not prove cloud
-deployment or PDF extraction support.
+API with PostgreSQL/pgvector, and runs the complete PDF upload → persistence → retrieval
+→ cited Q&A flow before and after an API restart. CI passing does not prove cloud
+deployment or OCR support.
 
 ## Deploy
 
@@ -153,4 +158,5 @@ For a test deployment on a VM, install Docker/Compose, clone this repository,
 replace the development database credentials, and run `docker compose up --build -d`.
 Then use the smoke test against the mapped HTTP endpoint (prefer an authenticated
 HTTPS reverse proxy for remote access). Consult `docs/architecture/` before
-scaling: vector index durability, migrations, auth and PDF/Q&A are outstanding.
+scaling: managed migrations, authentication, OCR, and background ingestion remain
+future production work.

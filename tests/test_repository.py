@@ -49,8 +49,22 @@ def test_sql_repository_round_trips_and_replaces_chunks_atomically() -> None:
                 "sha256", "uploaded_at", "character_count"
             )},
             "chunks": (
-                TextChunk(index=0, text="hello", start_char=0, end_char=5),
-                TextChunk(index=1, text="world", start_char=6, end_char=11),
+                TextChunk(
+                    index=0,
+                    text="hello",
+                    start_char=0,
+                    end_char=5,
+                    page_start=1,
+                    page_end=1,
+                ),
+                TextChunk(
+                    index=1,
+                    text="world",
+                    start_char=6,
+                    end_char=11,
+                    page_start=2,
+                    page_end=2,
+                ),
             ),
         }
     )

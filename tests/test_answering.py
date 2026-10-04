@@ -8,10 +8,17 @@ from app.parsing import TextChunk
 from app.vector_store import SearchHit
 
 
-def hit(text: str, score: float, index: int = 0) -> SearchHit:
+def hit(text: str, score: float, index: int = 0, page: int | None = None) -> SearchHit:
     return SearchHit(
         document_id="doc-1",
-        chunk=TextChunk(index=index, text=text, start_char=index * 10, end_char=index * 10 + len(text)),
+        chunk=TextChunk(
+            index=index,
+            text=text,
+            start_char=index * 10,
+            end_char=index * 10 + len(text),
+            page_start=page,
+            page_end=page,
+        ),
         score=score,
     )
 
@@ -43,6 +50,7 @@ def test_openai_generator_validates_and_maps_citations() -> None:
         payload = json.loads(request.read())
         assert payload["model"] == "answer-test"
         assert "SOURCE 2" in payload["messages"][1]["content"]
+        assert "pages=4:4" in payload["messages"][1]["content"]
         return httpx.Response(
             200,
             json={
@@ -69,7 +77,10 @@ def test_openai_generator_validates_and_maps_citations() -> None:
     )
     result = generator.generate(
         "What is Redis used for?",
-        [hit("PostgreSQL stores metadata.", 0.8), hit("Redis is used as a cache.", 0.7, 1)],
+        [
+            hit("PostgreSQL stores metadata.", 0.8),
+            hit("Redis is used as a cache.", 0.7, 1, page=4),
+        ],
     )
 
     assert result.answer == "Redis is used as a cache."

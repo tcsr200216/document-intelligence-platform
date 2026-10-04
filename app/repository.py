@@ -96,6 +96,8 @@ chunks_table = Table(
     Column("text", Text, nullable=False),
     Column("start_char", Integer, nullable=False),
     Column("end_char", Integer, nullable=False),
+    Column("page_start", Integer, nullable=True),
+    Column("page_end", Integer, nullable=True),
 )
 
 
@@ -115,6 +117,20 @@ class SqlDocumentRepository:
 
     def create_schema(self) -> None:
         metadata.create_all(self._engine)
+        if self._engine.dialect.name == "postgresql":
+            with self._engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "ALTER TABLE document_chunks "
+                        "ADD COLUMN IF NOT EXISTS page_start INTEGER"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "ALTER TABLE document_chunks "
+                        "ADD COLUMN IF NOT EXISTS page_end INTEGER"
+                    )
+                )
 
     def save(self, record: DocumentRecord) -> None:
         # The metadata row and all citation spans change in one transaction.
@@ -150,6 +166,8 @@ class SqlDocumentRepository:
                             "text": chunk.text,
                             "start_char": chunk.start_char,
                             "end_char": chunk.end_char,
+                            "page_start": chunk.page_start,
+                            "page_end": chunk.page_end,
                         }
                         for chunk in record.chunks
                     ],
@@ -184,6 +202,8 @@ class SqlDocumentRepository:
                     text=row["text"],
                     start_char=row["start_char"],
                     end_char=row["end_char"],
+                    page_start=row["page_start"],
+                    page_end=row["page_end"],
                 )
                 for row in rows
             ),

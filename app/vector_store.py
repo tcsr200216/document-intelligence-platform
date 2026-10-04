@@ -208,6 +208,8 @@ class PgVectorStore:
             Column("text", Text, nullable=False),
             Column("start_char", Integer, nullable=False),
             Column("end_char", Integer, nullable=False),
+            Column("page_start", Integer, nullable=True),
+            Column("page_end", Integer, nullable=True),
             Column("embedding", VECTOR(dimensions), nullable=False),
         )
         # pgvector's vector HNSW index supports up to 2,000 dimensions. Higher
@@ -245,6 +247,18 @@ class PgVectorStore:
             connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         self._metadata.create_all(self._engine)
         with self._engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE document_vectors "
+                    "ADD COLUMN IF NOT EXISTS page_start INTEGER"
+                )
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE document_vectors "
+                    "ADD COLUMN IF NOT EXISTS page_end INTEGER"
+                )
+            )
             configured = connection.execute(select(self._config)).mappings().one_or_none()
             expected = {
                 "id": 1,
@@ -292,6 +306,8 @@ class PgVectorStore:
                 "text": chunk.text,
                 "start_char": chunk.start_char,
                 "end_char": chunk.end_char,
+                "page_start": chunk.page_start,
+                "page_end": chunk.page_end,
                 "embedding": self._validate_vector(vector),
             }
             for chunk, vector in zip(chunks, vectors, strict=True)
@@ -343,6 +359,8 @@ class PgVectorStore:
                     text=row["text"],
                     start_char=row["start_char"],
                     end_char=row["end_char"],
+                    page_start=row["page_start"],
+                    page_end=row["page_end"],
                 ),
                 score=max(-1.0, min(1.0, 1.0 - float(row["distance"]))),
             )

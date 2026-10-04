@@ -98,12 +98,19 @@ class OpenAIAnswerGenerator:
                 citation_indices=(),
             )
 
-        sources = "\n\n".join(
-            f"SOURCE {index}\n"
-            f"document_id={hit.document_id} chunk={hit.chunk.index} "
-            f"chars={hit.chunk.start_char}:{hit.chunk.end_char}\n{hit.chunk.text}"
-            for index, hit in enumerate(contexts, start=1)
-        )
+        source_blocks: list[str] = []
+        for index, hit in enumerate(contexts, start=1):
+            page = (
+                f" pages={hit.chunk.page_start}:{hit.chunk.page_end}"
+                if hit.chunk.page_start is not None
+                else ""
+            )
+            source_blocks.append(
+                f"SOURCE {index}\n"
+                f"document_id={hit.document_id} chunk={hit.chunk.index} "
+                f"chars={hit.chunk.start_char}:{hit.chunk.end_char}{page}\n{hit.chunk.text}"
+            )
+        sources = "\n\n".join(source_blocks)
         try:
             response = self._client.post(
                 f"{self._base_url}/chat/completions",

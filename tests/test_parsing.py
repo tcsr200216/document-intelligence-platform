@@ -1,6 +1,13 @@
 import pytest
+from conftest import build_text_pdf
 
-from app.parsing import DocumentParseError, chunk_text, parse_text_document
+from app.parsing import (
+    DocumentParseError,
+    chunk_document,
+    chunk_text,
+    parse_pdf_document,
+    parse_text_document,
+)
 
 
 def test_parse_text_document_normalizes_line_endings_and_metadata() -> None:
@@ -24,6 +31,44 @@ def test_parse_markdown_document_preserves_markdown_content() -> None:
     assert parsed.extension == ".md"
     assert parsed.text == "# Architecture\n\n- FastAPI\n- PostgreSQL"
     assert parsed.line_count == 4
+
+
+def test_parse_pdf_preserves_real_page_numbers_and_normalized_offsets() -> None:
+    parsed = parse_pdf_document(
+        "architecture.pdf",
+        build_text_pdf(
+            "PostgreSQL stores durable metadata.",
+            "Page two provides exact citations.",
+        ),
+    )
+
+    assert parsed.text == (
+        "PostgreSQL stores durable metadata.\n\nPage two provides exact citations."
+    )
+    assert [(page.page_number, page.start_char, page.end_char) for page in parsed.pages] == [
+        (1, 0, 35),
+        (2, 37, 71),
+    ]
+    assert all(parsed.text[page.start_char : page.end_char] for page in parsed.pages)
+
+
+def test_chunk_document_never_crosses_pdf_page_boundaries() -> None:
+    parsed = parse_pdf_document(
+        "pages.pdf",
+        build_text_pdf("A" * 30, "B" * 30),
+    )
+
+    chunks = chunk_document(parsed, max_chars=20, overlap_chars=5)
+
+    assert [chunk.page_start for chunk in chunks] == [1, 1, 2, 2]
+    assert all(chunk.page_start == chunk.page_end for chunk in chunks)
+    assert all(parsed.text[chunk.start_char : chunk.end_char] == chunk.text for chunk in chunks)
+
+
+@pytest.mark.parametrize("payload", [b"not a pdf", build_text_pdf("")])
+def test_parse_pdf_rejects_malformed_or_image_only_documents(payload: bytes) -> None:
+    with pytest.raises(DocumentParseError, match="readable PDF|no extractable text"):
+        parse_pdf_document("broken.pdf", payload)
 
 
 @pytest.mark.parametrize("filename", ["report.pdf", "document.docx", "README"])

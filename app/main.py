@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from app.answering import AnswerProviderError, AnswerStatus, build_answer_generator
 from app.config import settings
 from app.embeddings import build_embedder
-from app.parsing import DocumentParseError, chunk_text, parse_text_document
+from app.parsing import DocumentParseError, chunk_document, parse_document
 from app.repository import DocumentRecord, DocumentRepository, build_document_repository
 from app.vector_store import build_vector_store
 
@@ -83,6 +83,8 @@ class SearchResult(BaseModel):
     text: str
     start_char: int
     end_char: int
+    page_start: int | None
+    page_end: int | None
     score: float
 
 
@@ -98,6 +100,8 @@ class CitationResponse(BaseModel):
     text: str
     start_char: int
     end_char: int
+    page_start: int | None
+    page_end: int | None
     score: float
 
 
@@ -164,12 +168,6 @@ async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUpl
         )
     if content_type and content_type not in SUPPORTED_CONTENT_TYPES:
         raise HTTPException(status_code=415, detail=f"Unsupported content type '{content_type}'.")
-    if extension == ".pdf":
-        raise HTTPException(
-            status_code=501,
-            detail="PDF upload is recognized but PDF text extraction is not implemented yet.",
-        )
-
     payload = await file.read(MAX_DOCUMENT_SIZE_BYTES + 1)
     if not payload:
         raise HTTPException(status_code=400, detail="Uploaded document is empty.")
@@ -177,11 +175,11 @@ async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUpl
         raise HTTPException(status_code=413, detail="Document exceeds the 10 MB upload limit.")
 
     try:
-        parsed = parse_text_document(filename, payload)
+        parsed = parse_document(filename, payload)
     except DocumentParseError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    chunks = chunk_text(parsed.text)
+    chunks = chunk_document(parsed)
     vectors = embedder.embed([chunk.text for chunk in chunks])
     document_id = str(uuid4())
     uploaded_at = datetime.now(UTC)
@@ -253,6 +251,8 @@ async def search_documents(request: SearchRequest) -> list[SearchResult]:
             text=hit.chunk.text,
             start_char=hit.chunk.start_char,
             end_char=hit.chunk.end_char,
+            page_start=hit.chunk.page_start,
+            page_end=hit.chunk.page_end,
             score=hit.score,
         )
         for hit in hits
@@ -283,6 +283,8 @@ async def answer_question(request: QuestionRequest) -> QuestionResponse:
             text=hit.chunk.text,
             start_char=hit.chunk.start_char,
             end_char=hit.chunk.end_char,
+            page_start=hit.chunk.page_start,
+            page_end=hit.chunk.page_end,
             score=hit.score,
         )
         for index, hit in enumerate(hits)
