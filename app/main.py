@@ -14,7 +14,7 @@ from app.config import settings
 from app.embeddings import build_embedder
 from app.parsing import DocumentParseError, chunk_text, parse_text_document
 from app.repository import DocumentRecord, DocumentRepository, build_document_repository
-from app.vector_store import InMemoryVectorStore
+from app.vector_store import build_vector_store
 
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md"}
@@ -30,7 +30,11 @@ embedder = build_embedder(
     openai_base_url=settings.openai_base_url,
     timeout_seconds=settings.embedding_timeout_seconds,
 )
-vector_store = InMemoryVectorStore(dimensions=embedder.dimensions)
+vector_store = build_vector_store(
+    settings.database_url,
+    dimensions=embedder.dimensions,
+    model_version=embedder.model_version,
+)
 document_repository: DocumentRepository = build_document_repository(settings.database_url)
 answer_generator = build_answer_generator(
     provider=settings.answer_provider,
@@ -122,13 +126,15 @@ async def ready() -> dict[str, str | int]:
         raise HTTPException(status_code=503, detail="Embedding and vector-store dimensions differ.")
     if not document_repository.is_ready():
         raise HTTPException(status_code=503, detail="Document repository is unavailable.")
+    if not vector_store.is_ready():
+        raise HTTPException(status_code=503, detail="Vector store is unavailable.")
     return {
         "status": "ready",
         "embedding_provider": embedder.provider,
         "embedding_model": embedder.model_version,
         "embedding_dimensions": embedder.dimensions,
         "answer_provider": answer_generator.provider,
-        "vector_store": "memory",
+        "vector_store": vector_store.backend,
         "document_store": document_repository.backend,
     }
 

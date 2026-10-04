@@ -40,7 +40,12 @@ jobs:
       - name: Build and start API with PostgreSQL
         run: docker compose up --build --detach --wait
       - name: Exercise upload, persistence, retrieval, and cited Q&A
-        run: python scripts/smoke_test.py
+        run: python scripts/smoke_test.py --document-id-output /tmp/document-id
+      - name: Prove vectors and citations survive an API restart
+        run: |
+          docker compose restart api
+          docker compose up --detach --wait
+          python scripts/smoke_test.py --verify-document-id-file /tmp/document-id
       - name: Show container logs on failure
         if: failure()
         run: docker compose logs --no-color

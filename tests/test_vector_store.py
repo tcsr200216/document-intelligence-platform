@@ -3,7 +3,7 @@ import math
 import pytest
 
 from app.parsing import TextChunk
-from app.vector_store import InMemoryVectorStore
+from app.vector_store import InMemoryVectorStore, build_vector_store
 
 
 def span(index: int, text: str, start: int = 0) -> TextChunk:
@@ -108,3 +108,10 @@ def test_invalid_query_limit_and_document_id_are_rejected() -> None:
         store.search([1, 0], document_id=" ")
     with pytest.raises(ValueError, match="document_id"):
         store.replace_document(" ", [], [])
+
+
+def test_builder_keeps_key_free_local_store_without_database() -> None:
+    store = build_vector_store(None, dimensions=2, model_version="test-v1-2d")
+    assert isinstance(store, InMemoryVectorStore)
+    assert store.backend == "memory"
+    assert store.is_ready()
