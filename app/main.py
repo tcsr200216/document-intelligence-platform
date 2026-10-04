@@ -9,6 +9,7 @@ from uuid import uuid4
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from app.answering import AnswerProviderError, AnswerStatus, build_answer_generator
 from app.config import settings
 from app.embeddings import build_embedder
 from app.parsing import DocumentParseError, chunk_text, parse_text_document
@@ -31,6 +32,16 @@ embedder = build_embedder(
 )
 vector_store = InMemoryVectorStore(dimensions=embedder.dimensions)
 document_repository: DocumentRepository = build_document_repository(settings.database_url)
+answer_generator = build_answer_generator(
+    provider=settings.answer_provider,
+    openai_api_key=(
+        settings.openai_api_key.get_secret_value() if settings.openai_api_key else None
+    ),
+    openai_model=settings.openai_answer_model,
+    openai_base_url=settings.openai_base_url,
+    timeout_seconds=settings.answer_timeout_seconds,
+    min_relevance=settings.answer_min_relevance,
+)
 
 
 class DocumentUploadResponse(BaseModel):
@@ -71,6 +82,28 @@ class SearchResult(BaseModel):
     score: float
 
 
+class QuestionRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2_000)
+    document_id: str | None = Field(default=None, min_length=1, max_length=128)
+    context_limit: int = Field(default=5, ge=1, le=10)
+
+
+class CitationResponse(BaseModel):
+    document_id: str
+    chunk_index: int
+    text: str
+    start_char: int
+    end_char: int
+    score: float
+
+
+class QuestionResponse(BaseModel):
+    answer: str
+    status: AnswerStatus
+    answer_provider: str
+    citations: list[CitationResponse]
+
+
 app = FastAPI(
     title="Document Intelligence Platform",
     version="0.1.0",
@@ -94,6 +127,7 @@ async def ready() -> dict[str, str | int]:
         "embedding_provider": embedder.provider,
         "embedding_model": embedder.model_version,
         "embedding_dimensions": embedder.dimensions,
+        "answer_provider": answer_generator.provider,
         "vector_store": "memory",
         "document_store": document_repository.backend,
     }
@@ -217,3 +251,40 @@ async def search_documents(request: SearchRequest) -> list[SearchResult]:
         )
         for hit in hits
     ]
+
+
+@app.post("/questions", response_model=QuestionResponse, tags=["question-answering"])
+async def answer_question(request: QuestionRequest) -> QuestionResponse:
+    """Retrieve source spans, answer from them, and return validated citations."""
+    if not request.question.strip():
+        raise HTTPException(status_code=422, detail="Question must contain readable text.")
+
+    query_vector = embedder.embed([request.question])[0]
+    hits = vector_store.search(
+        query_vector,
+        limit=request.context_limit,
+        document_id=request.document_id,
+    )
+    try:
+        generated = answer_generator.generate(request.question, hits)
+    except AnswerProviderError as exc:
+        raise HTTPException(status_code=503, detail="Answer provider is unavailable.") from exc
+
+    citations = [
+        CitationResponse(
+            document_id=hit.document_id,
+            chunk_index=hit.chunk.index,
+            text=hit.chunk.text,
+            start_char=hit.chunk.start_char,
+            end_char=hit.chunk.end_char,
+            score=hit.score,
+        )
+        for index, hit in enumerate(hits)
+        if index in generated.citation_indices
+    ]
+    return QuestionResponse(
+        answer=generated.answer,
+        status=generated.status,
+        answer_provider=answer_generator.provider,
+        citations=citations,
+    )

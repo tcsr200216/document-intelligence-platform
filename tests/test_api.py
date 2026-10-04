@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app import main
+from app.answering import ExtractiveAnswerGenerator
 from app.embeddings import HashingEmbedder
 from app.repository import InMemoryDocumentRepository
 from app.vector_store import InMemoryVectorStore
@@ -13,6 +14,9 @@ def fresh_client(monkeypatch) -> TestClient:
         main, "vector_store", InMemoryVectorStore(dimensions=embedder.dimensions)
     )
     monkeypatch.setattr(main, "document_repository", InMemoryDocumentRepository())
+    monkeypatch.setattr(
+        main, "answer_generator", ExtractiveAnswerGenerator(min_relevance=0.0)
+    )
     return TestClient(main.app)
 
 
@@ -87,6 +91,7 @@ def test_ready_reports_embedding_store_and_metadata_configuration(monkeypatch) -
         "embedding_provider": "hashing",
         "embedding_model": "sha256-token-hashing-v1-64d",
         "embedding_dimensions": 64,
+        "answer_provider": "extractive",
         "vector_store": "memory",
         "document_store": "memory",
     }
@@ -134,3 +139,46 @@ def test_search_rejects_whitespace_only_query(monkeypatch) -> None:
     response = client.post("/search", json={"query": "   "})
     assert response.status_code == 422
     assert response.json()["detail"] == "Search query must contain readable text."
+
+
+def test_question_answer_returns_exact_traceable_citation(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+    payload = b"PostgreSQL stores durable document metadata and citation spans."
+    document = client.post(
+        "/documents/upload",
+        files={"file": ("architecture.txt", payload, "text/plain")},
+    ).json()
+
+    response = client.post(
+        "/questions",
+        json={
+            "question": "Where is durable document metadata stored?",
+            "document_id": document["document_id"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "answered"
+    assert body["answer_provider"] == "extractive"
+    assert body["answer"] == payload.decode()
+    assert body["citations"] == [
+        {
+            "document_id": document["document_id"],
+            "chunk_index": 0,
+            "text": payload.decode(),
+            "start_char": 0,
+            "end_char": len(payload.decode()),
+            "score": body["citations"][0]["score"],
+        }
+    ]
+
+
+def test_question_answer_abstains_without_indexed_context(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    response = client.post("/questions", json={"question": "What is the retention policy?"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "insufficient_context"
+    assert response.json()["citations"] == []

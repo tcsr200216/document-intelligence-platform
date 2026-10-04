@@ -6,8 +6,9 @@ pluggable embeddings → indexed cosine search**. Chunk text and source offsets 
 stored in a repository adapter (in memory or PostgreSQL). This is an evolving
 portfolio project: OpenAI-compatible semantic embeddings are available through
 environment configuration, while the deterministic hashing provider remains the
-key-free local default. Durable vector storage, PDF extraction, and grounded answer
-generation are future milestones, **not current capabilities**.
+key-free local default. Citation-backed Q&A is available through a deterministic
+extractive baseline or an OpenAI-compatible grounded generator. Durable vector
+storage and PDF extraction are future milestones, **not current capabilities**.
 
 ## Architecture
 
@@ -16,6 +17,7 @@ HTTP upload -> validate -> parse text -> chunk with exact source offsets
                                     -> Embedder (hashing or OpenAI) -> InMemoryVectorStore
                                     -> DocumentRepository (memory or PostgreSQL)
 HTTP search -> embed query -> rank chunks -> return document, chunk, score and source offsets
+HTTP question -> retrieve chunks -> grounded answer -> return only validated source citations
 ```
 
 See `docs/architecture/` for the recorded decisions and tradeoffs. The current
@@ -67,6 +69,26 @@ than silently switching models. Never mix embeddings from different models in on
 index; restart with an empty/rebuilt vector index after changing provider, model,
 or dimensions. See [ADR-006](docs/architecture/ADR-006-semantic-embedding-provider.md).
 
+### Ask citation-backed questions
+
+The default `ANSWER_PROVIDER=extractive` quotes the strongest relevant chunk and
+needs no key. Set `ANSWER_PROVIDER=openai` plus `OPENAI_API_KEY` to synthesize a
+grounded answer through an OpenAI-compatible chat endpoint. Remote responses are
+accepted only when every cited source number maps to retrieved context; invalid or
+uncited answers fail closed.
+
+```bash
+curl -fsS -X POST http://localhost:8000/questions \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Where is metadata stored?","document_id":"YOUR_DOCUMENT_ID"}'
+```
+
+The response includes answer status, provider, and citations containing the exact
+document ID, chunk index, chunk text, cosine score, and source character offsets.
+When context is absent or below the configured relevance threshold, the service
+returns `insufficient_context` with no citations. See
+[ADR-007](docs/architecture/ADR-007-citation-backed-question-answering.md).
+
 ### Run with Docker and PostgreSQL
 
 Requires Docker Engine/Desktop with Compose:
@@ -107,8 +129,9 @@ PDF upload returns an explicit 501 until extraction is implemented.
 
 `python -m pytest -q` covers parsing, chunking, embeddings, source provenance,
 vector retrieval, repository storage, and HTTP ingestion/search. The GitHub Actions
-workflow also compiles Python sources, runs critical lint checks and builds the
-container image. CI passing does not prove cloud deployment or PDF/semantic Q&A support.
+workflow compiles Python sources, runs lint and tests, builds the image, launches the
+API with PostgreSQL, and runs the complete upload → persistence → retrieval → cited
+Q&A smoke flow. CI passing does not prove cloud deployment or PDF extraction support.
 
 ## Deploy
 

@@ -51,7 +51,29 @@ def main(base_url: str = "http://127.0.0.1:8000") -> None:
             for hit in hits
         )
 
-    print(f"Smoke test passed: document {document['document_id']}, {len(hits)} search hit(s).")
+        question = client.post(
+            "/questions",
+            json={
+                "question": "Where are document metadata and citation spans stored?",
+                "document_id": document["document_id"],
+                "context_limit": 3,
+            },
+        )
+        question.raise_for_status()
+        answer = question.json()
+        assert answer["status"] == "answered"
+        assert answer["citations"]
+        assert all(
+            citation["document_id"] == document["document_id"]
+            and 0 <= citation["start_char"] < citation["end_char"]
+            and citation["text"]
+            for citation in answer["citations"]
+        )
+
+    print(
+        f"Smoke test passed: document {document['document_id']}, "
+        f"{len(hits)} search hit(s), {len(answer['citations'])} answer citation(s)."
+    )
 
 
 if __name__ == "__main__":
