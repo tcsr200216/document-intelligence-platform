@@ -33,11 +33,7 @@ def build_sample_pdf() -> bytes:
             )
         )
         page[NameObject("/Resources")] = DictionaryObject(
-            {
-                NameObject("/Font"): DictionaryObject(
-                    {NameObject("/F1"): font_reference}
-                )
-            }
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_reference})}
         )
         stream = StreamObject()
         stream.set_data(f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("ascii"))
@@ -47,16 +43,11 @@ def build_sample_pdf() -> bytes:
     return output.getvalue()
 
 
-def verify_document(
-    client: httpx.Client, document_id: str, sample: bytes
-) -> tuple[int, int]:
+def verify_document(client: httpx.Client, document_id: str, sample: bytes) -> tuple[int, int]:
     detail = client.get(f"/documents/{document_id}")
     detail.raise_for_status()
     assert detail.json()["sha256"] == hashlib.sha256(sample).hexdigest()
-    query = (
-        "Where are document metadata and citation spans stored? "
-        f"smoke-verification-{uuid4()}"
-    )
+    query = f"Where are document metadata and citation spans stored? smoke-verification-{uuid4()}"
 
     response = client.post(
         "/search",
@@ -140,6 +131,14 @@ def main() -> None:
             assert document["status"] == "indexed"
             assert document["chunk_count"] > 0
             document_id = document["document_id"]
+            retry = client.post(
+                "/documents/upload",
+                files={"file": ("renamed-sample.pdf", sample, "application/pdf")},
+            )
+            retry.raise_for_status()
+            assert retry.status_code == 200
+            assert retry.json()["status"] == "already_indexed"
+            assert retry.json()["document_id"] == document_id
             if args.document_id_output:
                 args.document_id_output.write_text(document_id + "\n")
 
@@ -152,6 +151,7 @@ def main() -> None:
         metrics.raise_for_status()
         assert "document_intelligence_http_requests_total" in metrics.text
         assert "document_intelligence_ingestion_stages_total" in metrics.text
+        assert "document_intelligence_document_uploads_total" in metrics.text
         assert (
             'document_intelligence_embedding_cache_operations_total{operation="get",outcome="miss"}'
             in metrics.text

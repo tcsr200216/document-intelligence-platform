@@ -1,4 +1,6 @@
+import hashlib
 import json
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from conftest import build_text_pdf
@@ -11,21 +13,17 @@ from app import main
 from app.answering import ExtractiveAnswerGenerator
 from app.cache import InMemoryEmbeddingCache
 from app.embeddings import HashingEmbedder
-from app.repository import InMemoryDocumentRepository
+from app.repository import DocumentRecord, InMemoryDocumentRepository
 from app.vector_store import InMemoryVectorStore
 
 
 def fresh_client(monkeypatch) -> TestClient:
     embedder = HashingEmbedder(dimensions=64)
     monkeypatch.setattr(main, "embedder", embedder)
-    monkeypatch.setattr(
-        main, "vector_store", InMemoryVectorStore(dimensions=embedder.dimensions)
-    )
+    monkeypatch.setattr(main, "vector_store", InMemoryVectorStore(dimensions=embedder.dimensions))
     monkeypatch.setattr(main, "document_repository", InMemoryDocumentRepository())
     monkeypatch.setattr(main, "embedding_cache", InMemoryEmbeddingCache())
-    monkeypatch.setattr(
-        main, "answer_generator", ExtractiveAnswerGenerator(min_relevance=0.0)
-    )
+    monkeypatch.setattr(main, "answer_generator", ExtractiveAnswerGenerator(min_relevance=0.0))
     return TestClient(main.app)
 
 
@@ -53,6 +51,7 @@ def test_upload_indexes_persists_and_search_returns_traceable_source(monkeypatch
     assert detail.json()["filename"] == "architecture.txt"
     assert detail.json()["chunk_count"] == 1
     assert detail.json()["sha256"] == body["sha256"]
+    assert detail.json()["status"] == "indexed"
 
     search = client.post(
         "/search",
@@ -67,6 +66,66 @@ def test_upload_indexes_persists_and_search_returns_traceable_source(monkeypatch
     assert results[0]["end_char"] == len(payload.decode())
     assert results[0]["text"] == payload.decode()
     assert results[0]["score"] > 0
+
+
+def test_identical_upload_retry_reuses_index_without_reembedding(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    class CountingEmbedder(HashingEmbedder):
+        calls = 0
+
+        def embed(self, texts):
+            self.calls += 1
+            return super().embed(texts)
+
+    embedder = CountingEmbedder(dimensions=64)
+    monkeypatch.setattr(main, "embedder", embedder)
+    payload = b"Content-addressed uploads avoid duplicate citations."
+
+    first = client.post(
+        "/documents/upload",
+        files={"file": ("original.txt", payload, "text/plain")},
+    )
+    retry = client.post(
+        "/documents/upload",
+        files={"file": ("renamed.txt", payload, "text/plain")},
+    )
+
+    assert first.status_code == 201
+    assert retry.status_code == 200
+    assert retry.json()["status"] == "already_indexed"
+    assert retry.json()["document_id"] == first.json()["document_id"]
+    assert retry.json()["filename"] == "original.txt"
+    assert embedder.calls == 1
+
+
+def test_duplicate_upload_reports_in_progress_before_embedding(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+    payload = b"Only one ingestion may own this exact content."
+    digest = hashlib.sha256(payload).hexdigest()
+    repository = InMemoryDocumentRepository()
+    repository.save(
+        DocumentRecord(
+            document_id="in-progress-document",
+            filename="first.txt",
+            content_type="text/plain",
+            size_bytes=len(payload),
+            sha256=digest,
+            uploaded_at=datetime.now(UTC),
+            character_count=len(payload),
+            chunks=(),
+            status="indexing",
+        )
+    )
+    monkeypatch.setattr(main, "document_repository", repository)
+
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("retry.txt", payload, "text/plain")},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["document_id"] == "in-progress-document"
 
 
 def test_search_can_be_scoped_to_uploaded_document(monkeypatch) -> None:
@@ -198,6 +257,35 @@ def test_index_failure_compensates_persisted_metadata(monkeypatch) -> None:
     assert response.status_code == 503
     assert repository.last_saved_id is not None
     assert repository.get(repository.last_saved_id) is None
+
+
+def test_publish_failure_removes_vectors_and_incomplete_metadata(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    class FailingPublishRepository(InMemoryDocumentRepository):
+        last_saved_id: str | None = None
+
+        def save(self, record):
+            self.last_saved_id = record.document_id
+            super().save(record)
+
+        def mark_indexed(self, document_id):
+            raise SQLAlchemyError("publish unavailable")
+
+    repository = FailingPublishRepository()
+    store = InMemoryVectorStore(dimensions=64)
+    monkeypatch.setattr(main, "document_repository", repository)
+    monkeypatch.setattr(main, "vector_store", store)
+
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("publish-failure.txt", b"recoverable content", "text/plain")},
+    )
+
+    assert response.status_code == 503
+    assert repository.last_saved_id is not None
+    assert repository.get(repository.last_saved_id) is None
+    assert store.search([1.0] + [0.0] * 63, document_id=repository.last_saved_id) == []
 
 
 def test_pdf_upload_enters_retrieval_and_cited_question_flow(monkeypatch) -> None:
@@ -375,9 +463,7 @@ def test_requests_include_correlation_id_and_metrics_use_route_templates(
     assert document_log["request_id"] == response.headers["X-Request-ID"]
     assert document_log["status"] == 404
     assert unknown_document_id not in json.dumps(completion_logs)
-    families = {
-        family.name: family for family in text_string_to_metric_families(metrics.text)
-    }
+    families = {family.name: family for family in text_string_to_metric_families(metrics.text)}
     samples = families["document_intelligence_http_requests"].samples
     assert any(
         sample.labels
@@ -412,11 +498,26 @@ def test_pipeline_metrics_report_formats_stages_retrieval_and_answer_status(monk
 
     metrics = client.get("/metrics").text
 
-    assert 'document_intelligence_ingestion_stages_total{format="txt",outcome="success",stage="completed"}' in metrics
-    assert 'document_intelligence_retrieval_requests_total{operation="search",outcome="success"}' in metrics
-    assert 'document_intelligence_retrieval_requests_total{operation="question",outcome="success"}' in metrics
-    assert 'document_intelligence_answer_outcomes_total{provider="extractive",status="answered"}' in metrics
-    assert 'document_intelligence_embedding_cache_operations_total{operation="get",outcome="miss"}' in metrics
+    assert (
+        'document_intelligence_ingestion_stages_total{format="txt",outcome="success",stage="completed"}'
+        in metrics
+    )
+    assert (
+        'document_intelligence_retrieval_requests_total{operation="search",outcome="success"}'
+        in metrics
+    )
+    assert (
+        'document_intelligence_retrieval_requests_total{operation="question",outcome="success"}'
+        in metrics
+    )
+    assert (
+        'document_intelligence_answer_outcomes_total{provider="extractive",status="answered"}'
+        in metrics
+    )
+    assert (
+        'document_intelligence_embedding_cache_operations_total{operation="get",outcome="miss"}'
+        in metrics
+    )
 
 
 def test_parse_failure_is_observable_without_document_identity(monkeypatch) -> None:
@@ -429,5 +530,8 @@ def test_parse_failure_is_observable_without_document_identity(monkeypatch) -> N
     metrics = client.get("/metrics").text
 
     assert response.status_code == 422
-    assert 'document_intelligence_ingestion_stages_total{format="txt",outcome="error",stage="parse"}' in metrics
+    assert (
+        'document_intelligence_ingestion_stages_total{format="txt",outcome="error",stage="parse"}'
+        in metrics
+    )
     assert "private-name.txt" not in metrics

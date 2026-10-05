@@ -58,6 +58,15 @@ Both operations are idempotent at their storage boundaries and emit bounded life
 metrics. See
 [ADR-003](docs/architecture/ADR-003-ingestion-retrieval-orchestration.md).
 
+Uploads are content-addressed by the SHA-256 digest of the original bytes. The first
+successful upload returns `201` with `status: indexed`; an identical retry returns
+`200` with the original document ID and `status: already_indexed` without parsing or
+embedding again—even if the retry uses a different filename. PostgreSQL enforces one
+document per digest, and an `indexing` → `indexed` publication state prevents a racing
+request from claiming incomplete vectors are ready. A concurrent retry receives `409`
+with the in-progress document ID so it can poll `GET /documents/{document_id}`. See
+[ADR-013](docs/architecture/ADR-013-content-addressed-idempotent-ingestion.md).
+
 ## Run locally
 
 Requires **Python 3.12+**. With no `DATABASE_URL`, no external services are needed:
@@ -77,9 +86,9 @@ python -m pytest -q
 ```
 
 Open http://localhost:8000/docs for interactive API documentation.
-The smoke script builds and uploads a real two-page text PDF, fetches its metadata,
-and exercises document-scoped search and citation-backed Q&A. It exits nonzero if
-any step fails.
+The smoke script builds and uploads a real two-page text PDF, proves an identical retry
+reuses the indexed document, fetches its metadata, and exercises document-scoped search
+and citation-backed Q&A. It exits nonzero if any step fails.
 
 ### Use semantic embeddings
 
@@ -148,6 +157,7 @@ the local database volume. Never use example credentials for a public deployment
 ```bash
 curl -fsS -F "file=@data/sample_document.txt;type=text/plain" \
   http://localhost:8000/documents/upload
+# Repeating this upload returns HTTP 200 and the same document_id without re-embedding.
 # From the JSON response, copy document_id:
 curl -fsS http://localhost:8000/documents/YOUR_DOCUMENT_ID
 curl -fsS -X POST http://localhost:8000/search \
@@ -168,8 +178,8 @@ an explicit validation error instead of being indexed as empty content. See
 `python -m pytest -q` covers parsing, chunking, embeddings, source provenance,
 lexical/vector fusion, repository storage, and HTTP ingestion/search. The GitHub Actions
 workflow compiles Python sources, runs lint and tests, builds the image, launches the
-API with PostgreSQL/pgvector, and runs the complete PDF upload → persistence → retrieval
-→ cited Q&A → restart → deletion flow. CI passing does not prove cloud
+API with PostgreSQL/pgvector, and runs the complete PDF upload → idempotent retry →
+persistence → retrieval → cited Q&A → restart → deletion flow. CI passing does not prove cloud
 deployment or OCR support.
 
 ## Deploy

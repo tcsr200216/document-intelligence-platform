@@ -1,10 +1,13 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy import create_engine
 
 from app.parsing import TextChunk
 from app.repository import (
     DocumentRecord,
+    DuplicateDocumentError,
     InMemoryDocumentRepository,
     SqlDocumentRepository,
 )
@@ -19,9 +22,7 @@ def record(document_id: str = "doc-1") -> DocumentRecord:
         sha256="a" * 64,
         uploaded_at=datetime(2026, 10, 1, 12, 0, tzinfo=UTC),
         character_count=11,
-        chunks=(
-            TextChunk(index=0, text="hello world", start_char=0, end_char=11),
-        ),
+        chunks=(TextChunk(index=0, text="hello world", start_char=0, end_char=11),),
     )
 
 
@@ -32,12 +33,25 @@ def test_memory_repository_round_trips_exact_chunk_offsets() -> None:
     repository.save(source)
 
     assert repository.get(source.document_id) == source
+    assert repository.get_by_sha256(source.sha256) == source
     assert repository.get("missing") is None
     assert repository.is_ready() is True
 
     assert repository.delete(source.document_id) is True
     assert repository.delete(source.document_id) is False
     assert repository.get(source.document_id) is None
+
+
+def test_memory_repository_enforces_unique_content_and_publishes_status() -> None:
+    repository = InMemoryDocumentRepository()
+    indexing = replace(record(), status="indexing")
+    repository.save(indexing)
+
+    with pytest.raises(DuplicateDocumentError):
+        repository.save(record("doc-2"))
+
+    repository.mark_indexed(indexing.document_id)
+    assert repository.get(indexing.document_id).status == "indexed"
 
 
 def test_sql_repository_round_trips_and_replaces_chunks_atomically() -> None:
@@ -48,10 +62,18 @@ def test_sql_repository_round_trips_and_replaces_chunks_atomically() -> None:
 
     replacement = DocumentRecord(
         **{
-            **{field: getattr(original, field) for field in (
-                "document_id", "filename", "content_type", "size_bytes",
-                "sha256", "uploaded_at", "character_count"
-            )},
+            **{
+                field: getattr(original, field)
+                for field in (
+                    "document_id",
+                    "filename",
+                    "content_type",
+                    "size_bytes",
+                    "sha256",
+                    "uploaded_at",
+                    "character_count",
+                )
+            },
             "chunks": (
                 TextChunk(
                     index=0,
@@ -85,6 +107,33 @@ def test_sql_repository_returns_none_for_unknown_document() -> None:
     repository.create_schema()
 
     assert repository.get("missing") is None
+    assert repository.get_by_sha256("f" * 64) is None
+
+
+def test_sql_repository_enforces_unique_content_and_publishes_status() -> None:
+    repository = SqlDocumentRepository(create_engine("sqlite+pysqlite:///:memory:"))
+    repository.create_schema()
+    source = record()
+    indexing = DocumentRecord(
+        document_id=source.document_id,
+        filename=source.filename,
+        content_type=source.content_type,
+        size_bytes=source.size_bytes,
+        sha256=source.sha256,
+        uploaded_at=source.uploaded_at,
+        character_count=source.character_count,
+        chunks=source.chunks,
+        status="indexing",
+    )
+    repository.save(indexing)
+
+    with pytest.raises(DuplicateDocumentError):
+        repository.save(record("doc-2"))
+
+    repository.mark_indexed(indexing.document_id)
+    restored = repository.get_by_sha256(indexing.sha256)
+    assert restored is not None
+    assert restored.status == "indexed"
 
 
 def test_sql_repository_delete_removes_document_and_chunks_idempotently() -> None:

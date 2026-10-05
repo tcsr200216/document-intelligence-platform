@@ -64,6 +64,11 @@ DOCUMENT_DELETIONS = Counter(
     "Document deletion outcomes across vector and metadata stores.",
     ("outcome",),
 )
+DOCUMENT_UPLOADS = Counter(
+    "document_intelligence_document_uploads_total",
+    "Document upload outcomes including content-addressed retries.",
+    ("outcome", "format"),
+)
 
 _UNMEASURED_PATHS = frozenset({"/health", "/ready", "/metrics"})
 
@@ -71,9 +76,7 @@ _UNMEASURED_PATHS = frozenset({"/health", "/ready", "/metrics"})
 class HttpObservabilityMiddleware(BaseHTTPMiddleware):
     """Add correlation IDs, structured completion logs, and bounded HTTP metrics."""
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         request_id = str(uuid4())
         request.state.request_id = request_id
         started = time.perf_counter()

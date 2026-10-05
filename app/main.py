@@ -19,6 +19,7 @@ from app.embeddings import EmbeddingProviderError, build_embedder
 from app.observability import (
     ANSWER_OUTCOMES,
     DOCUMENT_DELETIONS,
+    DOCUMENT_UPLOADS,
     EMBEDDING_CACHE_OPERATIONS,
     INGESTED_CHUNKS,
     INGESTION_DURATION,
@@ -29,7 +30,12 @@ from app.observability import (
     metrics_response,
 )
 from app.parsing import DocumentParseError, chunk_document, parse_document
-from app.repository import DocumentRecord, DocumentRepository, build_document_repository
+from app.repository import (
+    DocumentRecord,
+    DocumentRepository,
+    DuplicateDocumentError,
+    build_document_repository,
+)
 from app.retrieval import HybridRetriever
 from app.vector_store import build_vector_store
 
@@ -91,6 +97,7 @@ class DocumentDetailResponse(BaseModel):
     uploaded_at: datetime
     character_count: int
     chunk_count: int
+    status: str
 
 
 class SearchRequest(BaseModel):
@@ -224,7 +231,10 @@ def _embed_query(text: str, operation: str) -> tuple[float, ...] | list[float]:
     status_code=201,
     tags=["documents"],
 )
-async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUploadResponse:
+async def upload_document(
+    response: Response,
+    file: Annotated[UploadFile, File(...)],
+) -> DocumentUploadResponse:
     """Parse, chunk, embed, index, and persist traceable document metadata."""
     filename = file.filename or "unnamed"
     extension = Path(filename).suffix.lower()
@@ -245,6 +255,26 @@ async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUpl
         raise HTTPException(status_code=400, detail="Uploaded document is empty.")
     if len(payload) > MAX_DOCUMENT_SIZE_BYTES:
         raise HTTPException(status_code=413, detail="Document exceeds the 10 MB upload limit.")
+    sha256 = hashlib.sha256(payload).hexdigest()
+
+    try:
+        existing = document_repository.get_by_sha256(sha256)
+    except SQLAlchemyError as exc:
+        DOCUMENT_UPLOADS.labels("lookup_error", document_format).inc()
+        raise HTTPException(status_code=503, detail="Document repository is unavailable.") from exc
+    if existing is not None:
+        if existing.status != "indexed":
+            DOCUMENT_UPLOADS.labels("in_progress", document_format).inc()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Identical document ingestion is already in progress.",
+                    "document_id": existing.document_id,
+                },
+            )
+        response.status_code = 200
+        DOCUMENT_UPLOADS.labels("deduplicated", document_format).inc()
+        return _upload_response(existing, "already_indexed")
 
     try:
         parsed = parse_document(filename, payload)
@@ -262,22 +292,35 @@ async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUpl
     INGESTION_STAGES.labels("embed", "success", document_format).inc()
     document_id = str(uuid4())
     uploaded_at = datetime.now(UTC)
-    sha256 = hashlib.sha256(payload).hexdigest()
 
     # Persist the citation source before publishing it to the retriever. A
     # successful search result therefore always has durable metadata when SQL is configured.
     try:
-        document_repository.save(
-            DocumentRecord(
-                document_id=document_id,
-                filename=filename,
-                content_type=content_type or "application/octet-stream",
-                size_bytes=len(payload),
-                sha256=sha256,
-                uploaded_at=uploaded_at,
-                character_count=parsed.character_count,
-                chunks=tuple(chunks),
-            )
+        record = DocumentRecord(
+            document_id=document_id,
+            filename=filename,
+            content_type=content_type or "application/octet-stream",
+            size_bytes=len(payload),
+            sha256=sha256,
+            uploaded_at=uploaded_at,
+            character_count=parsed.character_count,
+            chunks=tuple(chunks),
+            status="indexing",
+        )
+        document_repository.save(record)
+    except DuplicateDocumentError:
+        existing = document_repository.get_by_sha256(sha256)
+        if existing is not None and existing.status == "indexed":
+            response.status_code = 200
+            DOCUMENT_UPLOADS.labels("deduplicated", document_format).inc()
+            return _upload_response(existing, "already_indexed")
+        DOCUMENT_UPLOADS.labels("in_progress", document_format).inc()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Identical document ingestion is already in progress.",
+                "document_id": existing.document_id if existing else None,
+            },
         )
     except SQLAlchemyError as exc:
         INGESTION_STAGES.labels("persist", "error", document_format).inc()
@@ -295,20 +338,51 @@ async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUpl
             INGESTION_STAGES.labels("rollback", "success", document_format).inc()
         raise HTTPException(status_code=503, detail="Vector store is unavailable.") from exc
     INGESTION_STAGES.labels("index", "success", document_format).inc()
+    try:
+        document_repository.mark_indexed(document_id)
+    except SQLAlchemyError as exc:
+        INGESTION_STAGES.labels("publish", "error", document_format).inc()
+        try:
+            vector_store.delete_document(document_id)
+            document_repository.delete(document_id)
+        except SQLAlchemyError:
+            INGESTION_STAGES.labels("rollback", "error", document_format).inc()
+        else:
+            INGESTION_STAGES.labels("rollback", "success", document_format).inc()
+        raise HTTPException(status_code=503, detail="Document repository is unavailable.") from exc
+    INGESTION_STAGES.labels("publish", "success", document_format).inc()
     INGESTION_STAGES.labels("completed", "success", document_format).inc()
     INGESTION_DURATION.labels(document_format).observe(time.perf_counter() - started)
     INGESTED_CHUNKS.labels(document_format).observe(len(chunks))
 
+    DOCUMENT_UPLOADS.labels("indexed", document_format).inc()
+    return _upload_response(
+        DocumentRecord(
+            document_id=document_id,
+            filename=filename,
+            content_type=content_type or "application/octet-stream",
+            size_bytes=len(payload),
+            sha256=sha256,
+            uploaded_at=uploaded_at,
+            character_count=parsed.character_count,
+            chunks=tuple(chunks),
+            status="indexed",
+        ),
+        "indexed",
+    )
+
+
+def _upload_response(record: DocumentRecord, status_value: str) -> DocumentUploadResponse:
     return DocumentUploadResponse(
-        document_id=document_id,
-        filename=filename,
-        content_type=content_type or "application/octet-stream",
-        size_bytes=len(payload),
-        sha256=sha256,
-        status="indexed",
-        uploaded_at=uploaded_at,
-        character_count=parsed.character_count,
-        chunk_count=len(chunks),
+        document_id=record.document_id,
+        filename=record.filename,
+        content_type=record.content_type,
+        size_bytes=record.size_bytes,
+        sha256=record.sha256,
+        status=status_value,
+        uploaded_at=record.uploaded_at,
+        character_count=record.character_count,
+        chunk_count=len(record.chunks),
     )
 
 
@@ -330,6 +404,7 @@ async def get_document(document_id: str) -> DocumentDetailResponse:
         uploaded_at=record.uploaded_at,
         character_count=record.character_count,
         chunk_count=len(record.chunks),
+        status=record.status,
     )
 
 
