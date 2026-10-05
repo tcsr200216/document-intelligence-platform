@@ -37,6 +37,33 @@ def test_search_can_be_scoped_to_one_document() -> None:
     assert store.search([1, 0], document_id="missing") == []
 
 
+def test_lexical_search_ranks_exact_evidence_and_preserves_provenance() -> None:
+    store = InMemoryVectorStore(dimensions=2)
+    weaker = span(1, "PostgreSQL stores metadata", start=10)
+    stronger = span(2, "PostgreSQL stores durable metadata in PostgreSQL", start=40)
+    store.replace_document("doc", [weaker, stronger], [[1, 0], [0, 1]])
+
+    hits = store.lexical_search("PostgreSQL durable metadata")
+
+    assert [hit.chunk for hit in hits] == [stronger, weaker]
+    assert hits[0].document_id == "doc"
+    assert hits[0].chunk.start_char == 40
+    assert hits[0].score == pytest.approx(1.0)
+    assert hits[1].score == pytest.approx(2 / 3)
+
+
+def test_lexical_search_supports_document_scope_and_ignores_non_words() -> None:
+    store = InMemoryVectorStore(dimensions=2)
+    store.replace_document("doc-a", [span(0, "shared token")], [[1, 0]])
+    store.replace_document("doc-b", [span(0, "shared token")], [[0, 1]])
+
+    assert [
+        hit.document_id
+        for hit in store.lexical_search("shared", document_id="doc-b")
+    ] == ["doc-b"]
+    assert store.lexical_search("---") == []
+
+
 def test_equal_scores_have_stable_document_and_chunk_order() -> None:
     store = InMemoryVectorStore(dimensions=2)
     store.replace_document("doc-z", [span(2, "z")], [[1, 0]])
@@ -106,6 +133,10 @@ def test_invalid_query_limit_and_document_id_are_rejected() -> None:
         store.search([1, 0], limit=0)
     with pytest.raises(ValueError, match="document_id filter"):
         store.search([1, 0], document_id=" ")
+    with pytest.raises(ValueError, match="limit"):
+        store.lexical_search("query", limit=0)
+    with pytest.raises(ValueError, match="document_id filter"):
+        store.lexical_search("query", document_id=" ")
     with pytest.raises(ValueError, match="document_id"):
         store.replace_document(" ", [], [])
 

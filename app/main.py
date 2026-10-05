@@ -29,6 +29,7 @@ from app.observability import (
 )
 from app.parsing import DocumentParseError, chunk_document, parse_document
 from app.repository import DocumentRecord, DocumentRepository, build_document_repository
+from app.retrieval import HybridRetriever
 from app.vector_store import build_vector_store
 
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024
@@ -332,8 +333,11 @@ async def search_documents(request: SearchRequest) -> list[SearchResult]:
 
     query_vector = _embed_query(request.query, "search")
     try:
-        hits = vector_store.search(
-            query_vector, limit=request.limit, document_id=request.document_id
+        hits = HybridRetriever(vector_store).retrieve(
+            request.query,
+            query_vector,
+            limit=request.limit,
+            document_id=request.document_id,
         )
     except SQLAlchemyError as exc:
         RETRIEVAL_REQUESTS.labels("search", "backend_error").inc()
@@ -363,7 +367,8 @@ async def answer_question(request: QuestionRequest) -> QuestionResponse:
 
     query_vector = _embed_query(request.question, "question")
     try:
-        hits = vector_store.search(
+        hits = HybridRetriever(vector_store).retrieve(
+            request.question,
             query_vector,
             limit=request.context_limit,
             document_id=request.document_id,

@@ -2,7 +2,7 @@
 
 A Python/FastAPI document ingestion and retrieval service. The currently implemented
 path is **upload → text/Markdown or page-aware PDF parsing → deterministic chunks →
-pluggable embeddings → indexed cosine search**. Chunk text, source offsets, and
+pluggable embeddings → hybrid lexical/vector retrieval**. Chunk text, source offsets, and
 vectors are stored behind repository adapters (in memory or PostgreSQL/pgvector).
 This is an evolving portfolio project: OpenAI-compatible semantic embeddings are available through
 environment configuration, while the deterministic hashing provider remains the
@@ -16,8 +16,8 @@ extracted locally; scanned/image-only PDFs fail clearly because OCR is not enabl
 HTTP upload -> validate -> parse text/PDF -> page-bounded chunks with exact offsets
                                     -> Embedder -> VectorStore (memory or pgvector)
                                     -> DocumentRepository (memory or PostgreSQL)
-HTTP search -> embed query -> rank chunks -> return document, chunk, score and source offsets
-HTTP question -> retrieve chunks -> grounded answer -> return only validated source citations
+HTTP search -> embed query -> semantic + lexical ranks -> RRF -> traceable source spans
+HTTP question -> hybrid retrieval -> grounded answer -> only validated source citations
 ```
 
 See `docs/architecture/` for the recorded decisions and tradeoffs. The current
@@ -25,10 +25,15 @@ hashing embedder measures deterministic token overlap, not semantic similarity.
 The OpenAI adapter performs real remote semantic embedding with strict response
 dimension, index, and numeric validation. Provider/model details appear in `/ready`.
 With PostgreSQL configured, document metadata, chunk provenance, and model-scoped
-vectors survive restarts. The pgvector adapter performs database-side cosine search
-through an HNSW index for vectors up to 2,000 dimensions (and an exact database
-scan above that limit). It refuses startup if the configured embedding model or
-dimensions differ from the durable index contract.
+vectors survive restarts. The PostgreSQL adapter performs database-side cosine search
+through a pgvector HNSW index for vectors up to 2,000 dimensions (and an exact scan
+above that limit), plus indexed English full-text search through a generated `tsvector`
+column and GIN index. Reciprocal Rank Fusion combines both candidate lists with
+deterministic tie-breaking, so exact identifiers and phrases can rescue evidence that
+semantic search ranks too low without discarding semantic matches. The response score
+is a normalized fusion score in `[0, 1]`, not raw cosine similarity. The durable store
+refuses startup if the configured embedding model or dimensions differ from its index
+contract. See [ADR-012](docs/architecture/ADR-012-hybrid-retrieval-with-rrf.md).
 
 Search and Q&A share a model-scoped query embedding cache. Local runs use a finite-TTL
 in-memory adapter; setting `REDIS_URL` enables a shared Redis adapter for multiple API
@@ -101,7 +106,7 @@ curl -fsS -X POST http://localhost:8000/questions \
 ```
 
 The response includes answer status, provider, and citations containing the exact
-document ID, chunk index, chunk text, cosine score, normalized source character
+document ID, chunk index, chunk text, normalized fusion score, normalized source character
 offsets, and PDF page range when applicable.
 When context is absent or below the configured relevance threshold, the service
 returns `insufficient_context` with no citations. See
@@ -150,7 +155,7 @@ an explicit validation error instead of being indexed as empty content. See
 ## Tests and CI
 
 `python -m pytest -q` covers parsing, chunking, embeddings, source provenance,
-vector retrieval, repository storage, and HTTP ingestion/search. The GitHub Actions
+lexical/vector fusion, repository storage, and HTTP ingestion/search. The GitHub Actions
 workflow compiles Python sources, runs lint and tests, builds the image, launches the
 API with PostgreSQL/pgvector, and runs the complete PDF upload → persistence → retrieval
 → cited Q&A flow before and after an API restart. CI passing does not prove cloud

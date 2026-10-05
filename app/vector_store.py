@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -8,6 +10,7 @@ from typing import Protocol
 from pgvector.sqlalchemy import VECTOR
 from sqlalchemy import (
     Column,
+    Computed,
     Index,
     Integer,
     MetaData,
@@ -17,9 +20,11 @@ from sqlalchemy import (
     create_engine,
     delete,
     insert,
+    func,
     select,
     text,
 )
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -37,7 +42,7 @@ class StoredChunk:
 
 @dataclass(frozen=True, slots=True)
 class SearchHit:
-    """A retrieved source span with its cosine-similarity score."""
+    """A retrieved source span and its backend-specific relevance score."""
 
     document_id: str
     chunk: TextChunk
@@ -76,6 +81,23 @@ class VectorStore(Protocol):
     ) -> list[SearchHit]:
         """Find the best matching source spans."""
         ...
+
+    def lexical_search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        document_id: str | None = None,
+    ) -> list[SearchHit]:
+        """Find source spans containing the query's lexical evidence."""
+        ...
+
+
+_LEXICAL_TOKEN = re.compile(r"[\w]+", re.UNICODE)
+
+
+def _lexical_tokens(text_value: str) -> tuple[str, ...]:
+    return tuple(_LEXICAL_TOKEN.findall(text_value.casefold()))
 
 
 class InMemoryVectorStore:
@@ -179,6 +201,48 @@ class InMemoryVectorStore:
             key=lambda hit: (-hit.score, hit.document_id, hit.chunk.index),
         )[:limit]
 
+    def lexical_search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        document_id: str | None = None,
+    ) -> list[SearchHit]:
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero.")
+        if document_id is not None and not document_id.strip():
+            raise ValueError("document_id filter must not be empty.")
+        query_tokens = _lexical_tokens(query)
+        if not query_tokens:
+            return []
+
+        query_counts = Counter(query_tokens)
+        documents = (
+            ((document_id, self._documents.get(document_id, ())),)
+            if document_id is not None
+            else self._documents.items()
+        )
+        hits: list[SearchHit] = []
+        for stored_document_id, records in documents:
+            for record in records:
+                chunk_counts = Counter(_lexical_tokens(record.chunk.text))
+                matched = sum(
+                    min(count, chunk_counts[token]) for token, count in query_counts.items()
+                )
+                if matched == 0:
+                    continue
+                hits.append(
+                    SearchHit(
+                        document_id=stored_document_id,
+                        chunk=record.chunk,
+                        score=matched / len(query_tokens),
+                    )
+                )
+        return sorted(
+            hits,
+            key=lambda hit: (-hit.score, hit.document_id, hit.chunk.index),
+        )[:limit]
+
 
 class PgVectorStore:
     """Durable PostgreSQL cosine retrieval scoped to one embedding model."""
@@ -211,6 +275,17 @@ class PgVectorStore:
             Column("page_start", Integer, nullable=True),
             Column("page_end", Integer, nullable=True),
             Column("embedding", VECTOR(dimensions), nullable=False),
+            Column(
+                "search_vector",
+                TSVECTOR,
+                Computed("to_tsvector('english', text)", persisted=True),
+                nullable=False,
+            ),
+        )
+        Index(
+            "ix_document_vectors_search_vector_gin",
+            self._vectors.c.search_vector,
+            postgresql_using="gin",
         )
         # pgvector's vector HNSW index supports up to 2,000 dimensions. Higher
         # dimensional providers remain durable and use exact database-side scans.
@@ -257,6 +332,18 @@ class PgVectorStore:
                 text(
                     "ALTER TABLE document_vectors "
                     "ADD COLUMN IF NOT EXISTS page_end INTEGER"
+                )
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE document_vectors ADD COLUMN IF NOT EXISTS search_vector "
+                    "tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_document_vectors_search_vector_gin "
+                    "ON document_vectors USING gin (search_vector)"
                 )
             )
             configured = connection.execute(select(self._config)).mappings().one_or_none()
@@ -363,6 +450,52 @@ class PgVectorStore:
                     page_end=row["page_end"],
                 ),
                 score=max(-1.0, min(1.0, 1.0 - float(row["distance"]))),
+            )
+            for row in rows
+        ]
+
+    def lexical_search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        document_id: str | None = None,
+    ) -> list[SearchHit]:
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero.")
+        if document_id is not None and not document_id.strip():
+            raise ValueError("document_id filter must not be empty.")
+        if not _lexical_tokens(query):
+            return []
+
+        text_query = func.websearch_to_tsquery("english", query)
+        rank = func.ts_rank_cd(self._vectors.c.search_vector, text_query)
+        statement = (
+            select(self._vectors, rank.label("rank"))
+            .where(self._vectors.c.model_version == self._model_version)
+            .where(self._vectors.c.search_vector.op("@@")(text_query))
+        )
+        if document_id is not None:
+            statement = statement.where(self._vectors.c.document_id == document_id)
+        statement = statement.order_by(
+            rank.desc(),
+            self._vectors.c.document_id,
+            self._vectors.c.chunk_index,
+        ).limit(limit)
+        with self._engine.connect() as connection:
+            rows = connection.execute(statement).mappings().all()
+        return [
+            SearchHit(
+                document_id=row["document_id"],
+                chunk=TextChunk(
+                    index=row["chunk_index"],
+                    text=row["text"],
+                    start_char=row["start_char"],
+                    end_char=row["end_char"],
+                    page_start=row["page_start"],
+                    page_end=row["page_end"],
+                ),
+                score=float(row["rank"]),
             )
             for row in rows
         ]
