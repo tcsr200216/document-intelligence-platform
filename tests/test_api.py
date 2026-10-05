@@ -4,9 +4,11 @@ from uuid import UUID, uuid4
 from conftest import build_text_pdf
 from fastapi.testclient import TestClient
 from prometheus_client.parser import text_string_to_metric_families
+from redis.exceptions import RedisError
 
 from app import main
 from app.answering import ExtractiveAnswerGenerator
+from app.cache import InMemoryEmbeddingCache
 from app.embeddings import HashingEmbedder
 from app.repository import InMemoryDocumentRepository
 from app.vector_store import InMemoryVectorStore
@@ -19,6 +21,7 @@ def fresh_client(monkeypatch) -> TestClient:
         main, "vector_store", InMemoryVectorStore(dimensions=embedder.dimensions)
     )
     monkeypatch.setattr(main, "document_repository", InMemoryDocumentRepository())
+    monkeypatch.setattr(main, "embedding_cache", InMemoryEmbeddingCache())
     monkeypatch.setattr(
         main, "answer_generator", ExtractiveAnswerGenerator(min_relevance=0.0)
     )
@@ -99,6 +102,7 @@ def test_ready_reports_embedding_store_and_metadata_configuration(monkeypatch) -
         "answer_provider": "extractive",
         "vector_store": "memory",
         "document_store": "memory",
+        "embedding_cache": "memory",
     }
 
 
@@ -109,6 +113,20 @@ def test_ready_rejects_dimension_mismatch(monkeypatch) -> None:
     response = client.get("/ready")
     assert response.status_code == 503
     assert response.json()["detail"] == "Embedding and vector-store dimensions differ."
+
+
+def test_ready_rejects_unavailable_configured_cache(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    class UnavailableCache(InMemoryEmbeddingCache):
+        def is_ready(self) -> bool:
+            return False
+
+    monkeypatch.setattr(main, "embedding_cache", UnavailableCache())
+
+    response = client.get("/ready")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Embedding cache is unavailable."
 
 
 def test_get_document_returns_404_for_unknown_id(monkeypatch) -> None:
@@ -152,6 +170,59 @@ def test_pdf_upload_enters_retrieval_and_cited_question_flow(monkeypatch) -> Non
     assert question.status_code == 200
     assert question.json()["status"] == "answered"
     assert question.json()["citations"][0]["page_start"] in {1, 2}
+
+
+def test_search_and_question_reuse_model_scoped_query_embedding(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    class CountingEmbedder(HashingEmbedder):
+        calls = 0
+
+        def embed(self, texts):
+            self.calls += 1
+            return super().embed(texts)
+
+    counting_embedder = CountingEmbedder(dimensions=64)
+    monkeypatch.setattr(main, "embedder", counting_embedder)
+    query = "Where is metadata stored?"
+    document = client.post(
+        "/documents/upload",
+        files={"file": ("cache.txt", b"PostgreSQL stores metadata.", "text/plain")},
+    ).json()
+
+    client.post(
+        "/search", json={"query": query, "document_id": document["document_id"]}
+    ).raise_for_status()
+    client.post(
+        "/questions", json={"question": query, "document_id": document["document_id"]}
+    ).raise_for_status()
+
+    assert counting_embedder.calls == 2
+
+
+def test_cache_failure_degrades_to_live_embedding(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    class FailingCache(InMemoryEmbeddingCache):
+        def get(self, text, *, model_version, dimensions):
+            raise RedisError("unavailable")
+
+        def set(self, text, vector, *, model_version, dimensions):
+            raise RedisError("unavailable")
+
+    monkeypatch.setattr(main, "embedding_cache", FailingCache())
+    document = client.post(
+        "/documents/upload",
+        files={"file": ("fallback.txt", b"PostgreSQL stores metadata.", "text/plain")},
+    ).json()
+
+    response = client.post(
+        "/search",
+        json={"query": "metadata", "document_id": document["document_id"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()
 
 
 def test_upload_surfaces_invalid_utf8_as_unprocessable_document(monkeypatch) -> None:
@@ -282,6 +353,7 @@ def test_pipeline_metrics_report_formats_stages_retrieval_and_answer_status(monk
     assert 'document_intelligence_retrieval_requests_total{operation="search",outcome="success"}' in metrics
     assert 'document_intelligence_retrieval_requests_total{operation="question",outcome="success"}' in metrics
     assert 'document_intelligence_answer_outcomes_total{provider="extractive",status="answered"}' in metrics
+    assert 'document_intelligence_embedding_cache_operations_total{operation="get",outcome="miss"}' in metrics
 
 
 def test_parse_failure_is_observable_without_document_identity(monkeypatch) -> None:

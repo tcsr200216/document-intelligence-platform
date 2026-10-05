@@ -54,6 +54,11 @@ ANSWER_OUTCOMES = Counter(
     "Grounded-answer outcomes by provider.",
     ("provider", "status"),
 )
+EMBEDDING_CACHE_OPERATIONS = Counter(
+    "document_intelligence_embedding_cache_operations_total",
+    "Query embedding cache operations by outcome.",
+    ("operation", "outcome"),
+)
 
 _UNMEASURED_PATHS = frozenset({"/health", "/ready", "/metrics"})
 

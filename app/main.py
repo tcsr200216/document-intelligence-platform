@@ -9,13 +9,16 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.answering import AnswerProviderError, AnswerStatus, build_answer_generator
+from app.cache import build_embedding_cache
 from app.config import settings
 from app.embeddings import EmbeddingProviderError, build_embedder
 from app.observability import (
     ANSWER_OUTCOMES,
+    EMBEDDING_CACHE_OPERATIONS,
     INGESTED_CHUNKS,
     INGESTION_DURATION,
     INGESTION_STAGES,
@@ -57,6 +60,11 @@ answer_generator = build_answer_generator(
     openai_base_url=settings.openai_base_url,
     timeout_seconds=settings.answer_timeout_seconds,
     min_relevance=settings.answer_min_relevance,
+)
+embedding_cache = build_embedding_cache(
+    settings.redis_url,
+    ttl_seconds=settings.embedding_cache_ttl_seconds,
+    namespace=settings.embedding_cache_namespace,
 )
 
 
@@ -145,6 +153,8 @@ async def ready() -> dict[str, str | int]:
         raise HTTPException(status_code=503, detail="Document repository is unavailable.")
     if not vector_store.is_ready():
         raise HTTPException(status_code=503, detail="Vector store is unavailable.")
+    if not embedding_cache.is_ready():
+        raise HTTPException(status_code=503, detail="Embedding cache is unavailable.")
     return {
         "status": "ready",
         "embedding_provider": embedder.provider,
@@ -153,6 +163,7 @@ async def ready() -> dict[str, str | int]:
         "answer_provider": answer_generator.provider,
         "vector_store": vector_store.backend,
         "document_store": document_repository.backend,
+        "embedding_cache": embedding_cache.backend,
     }
 
 
@@ -164,6 +175,45 @@ async def root() -> dict[str, str]:
 @app.get("/metrics", include_in_schema=False)
 async def metrics():
     return metrics_response()
+
+
+def _embed_query(text: str, operation: str) -> tuple[float, ...] | list[float]:
+    text = text.strip()
+    try:
+        cached = embedding_cache.get(
+            text,
+            model_version=embedder.model_version,
+            dimensions=embedder.dimensions,
+        )
+    except RedisError:
+        EMBEDDING_CACHE_OPERATIONS.labels("get", "error").inc()
+        cached = None
+    else:
+        if cached is not None:
+            EMBEDDING_CACHE_OPERATIONS.labels("get", "hit").inc()
+            return cached
+        EMBEDDING_CACHE_OPERATIONS.labels("get", "miss").inc()
+
+    try:
+        vector = embedder.embed([text])[0]
+    except EmbeddingProviderError as exc:
+        RETRIEVAL_REQUESTS.labels(operation, "embedding_error").inc()
+        if operation == "question":
+            ANSWER_OUTCOMES.labels(answer_generator.provider, "provider_error").inc()
+        raise HTTPException(status_code=503, detail="Embedding provider is unavailable.") from exc
+
+    try:
+        embedding_cache.set(
+            text,
+            vector,
+            model_version=embedder.model_version,
+            dimensions=embedder.dimensions,
+        )
+    except RedisError:
+        EMBEDDING_CACHE_OPERATIONS.labels("set", "error").inc()
+    else:
+        EMBEDDING_CACHE_OPERATIONS.labels("set", "success").inc()
+    return vector
 
 
 @app.post(
@@ -280,11 +330,7 @@ async def search_documents(request: SearchRequest) -> list[SearchResult]:
     if not request.query.strip():
         raise HTTPException(status_code=422, detail="Search query must contain readable text.")
 
-    try:
-        query_vector = embedder.embed([request.query])[0]
-    except EmbeddingProviderError as exc:
-        RETRIEVAL_REQUESTS.labels("search", "embedding_error").inc()
-        raise HTTPException(status_code=503, detail="Embedding provider is unavailable.") from exc
+    query_vector = _embed_query(request.query, "search")
     try:
         hits = vector_store.search(
             query_vector, limit=request.limit, document_id=request.document_id
@@ -315,12 +361,7 @@ async def answer_question(request: QuestionRequest) -> QuestionResponse:
     if not request.question.strip():
         raise HTTPException(status_code=422, detail="Question must contain readable text.")
 
-    try:
-        query_vector = embedder.embed([request.question])[0]
-    except EmbeddingProviderError as exc:
-        RETRIEVAL_REQUESTS.labels("question", "embedding_error").inc()
-        ANSWER_OUTCOMES.labels(answer_generator.provider, "provider_error").inc()
-        raise HTTPException(status_code=503, detail="Embedding provider is unavailable.") from exc
+    query_vector = _embed_query(request.question, "question")
     try:
         hits = vector_store.search(
             query_vector,

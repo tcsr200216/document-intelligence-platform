@@ -30,10 +30,17 @@ through an HNSW index for vectors up to 2,000 dimensions (and an exact database
 scan above that limit). It refuses startup if the configured embedding model or
 dimensions differ from the durable index contract.
 
+Search and Q&A share a model-scoped query embedding cache. Local runs use a finite-TTL
+in-memory adapter; setting `REDIS_URL` enables a shared Redis adapter for multiple API
+replicas. Cache keys include the embedding model contract and a SHA-256 query digest,
+never raw question text. Cached vectors are validated before use, and request handling
+falls back to live embedding when Redis has a transient failure. See
+[ADR-011](docs/architecture/ADR-011-model-scoped-query-embedding-cache.md).
+
 Every response includes a generated `X-Request-ID`, and the service emits one
 structured completion log per request. Prometheus metrics at `/metrics` cover HTTP
 traffic and latency, ingestion stages and duration, chunk counts, retrieval outcomes,
-result counts, and grounded-answer outcomes. Labels use route templates, document
+result counts, cache outcomes, and grounded-answer outcomes. Labels use route templates, document
 format, operation, provider, and finite outcome values; filenames, document IDs,
 questions, chunk text, and exception messages are never labels.
 
@@ -109,8 +116,8 @@ docker compose up --build -d
 docker compose ps
 ```
 
-The API is at http://localhost:8000/docs and pgvector-enabled PostgreSQL is
-internal to Compose.
+The API is at http://localhost:8000/docs; pgvector-enabled PostgreSQL and Redis are
+internal to Compose. `/ready` verifies both durable storage and the configured cache.
 The credentials in `compose.yaml` are **local development examples only**.
 Run `python scripts/smoke_test.py` on the host after installing the Python project,
 or use the following equivalent health check:
@@ -154,12 +161,13 @@ deployment or OCR support.
 The provided `Dockerfile` and `compose.yaml` support a single-host container
 deployment (for example on a Linux VM). Set a **private production PostgreSQL**
 instance with the pgvector extension and supply `DATABASE_URL` securely to the
-container; do not publish PostgreSQL to the Internet or reuse the Compose demo
-password. Configure HTTPS and authentication at a trusted reverse proxy, set
+container. Supply a private Redis instance through `REDIS_URL` when running multiple
+API replicas; do not publish PostgreSQL or Redis to the Internet or reuse the Compose
+demo password. Configure HTTPS and authentication at a trusted reverse proxy, set
 resource/upload limits, monitor `/health` and `/ready`, and scrape `/metrics` only
-from a private monitoring network. PostgreSQL-backed vectors are shared across API
-replicas; the no-database fallback remains process-local and is intended for
-development.
+from a private monitoring network. PostgreSQL-backed vectors and Redis-cached query
+embeddings are shared across API replicas; the no-database and no-Redis fallbacks
+remain process-local and are intended for development.
 
 For a test deployment on a VM, install Docker/Compose, clone this repository,
 replace the development database credentials, and run `docker compose up --build -d`.

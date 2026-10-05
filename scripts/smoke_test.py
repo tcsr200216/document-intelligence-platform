@@ -9,6 +9,7 @@ import argparse
 import hashlib
 from io import BytesIO
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 from pypdf import PdfWriter
@@ -52,11 +53,15 @@ def verify_document(
     detail = client.get(f"/documents/{document_id}")
     detail.raise_for_status()
     assert detail.json()["sha256"] == hashlib.sha256(sample).hexdigest()
+    query = (
+        "Where are document metadata and citation spans stored? "
+        f"smoke-verification-{uuid4()}"
+    )
 
     response = client.post(
         "/search",
         json={
-            "query": "Where are document metadata and citation spans stored?",
+            "query": query,
             "document_id": document_id,
             "limit": 3,
         },
@@ -70,7 +75,7 @@ def verify_document(
     question = client.post(
         "/questions",
         json={
-            "question": "Where are document metadata and citation spans stored?",
+            "question": query,
             "document_id": document_id,
             "context_limit": 3,
         },
@@ -129,6 +134,14 @@ def main() -> None:
         metrics.raise_for_status()
         assert "document_intelligence_http_requests_total" in metrics.text
         assert "document_intelligence_ingestion_stages_total" in metrics.text
+        assert (
+            'document_intelligence_embedding_cache_operations_total{operation="get",outcome="miss"}'
+            in metrics.text
+        )
+        assert (
+            'document_intelligence_embedding_cache_operations_total{operation="get",outcome="hit"}'
+            in metrics.text
+        )
         assert document_id not in metrics.text
 
     print(
