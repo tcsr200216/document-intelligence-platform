@@ -49,6 +49,10 @@ class DocumentRepository(Protocol):
     def get(self, document_id: str) -> DocumentRecord | None:
         ...
 
+    def delete(self, document_id: str) -> bool:
+        """Delete document metadata and chunks, returning whether it existed."""
+        ...
+
     def is_ready(self) -> bool:
         ...
 
@@ -66,6 +70,9 @@ class InMemoryDocumentRepository:
 
     def get(self, document_id: str) -> DocumentRecord | None:
         return self._documents.get(document_id)
+
+    def delete(self, document_id: str) -> bool:
+        return self._documents.pop(document_id, None) is not None
 
     def is_ready(self) -> bool:
         return True
@@ -208,6 +215,16 @@ class SqlDocumentRepository:
                 for row in rows
             ),
         )
+
+    def delete(self, document_id: str) -> bool:
+        with self._engine.begin() as connection:
+            connection.execute(
+                delete(chunks_table).where(chunks_table.c.document_id == document_id)
+            )
+            result = connection.execute(
+                delete(documents_table).where(documents_table.c.document_id == document_id)
+            )
+        return bool(result.rowcount)
 
     def is_ready(self) -> bool:
         try:

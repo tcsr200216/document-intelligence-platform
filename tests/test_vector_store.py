@@ -87,6 +87,17 @@ def test_replacing_document_removes_old_chunks() -> None:
     assert store.search([0, 1]) == []
 
 
+def test_delete_document_removes_semantic_and_lexical_candidates_idempotently() -> None:
+    store = InMemoryVectorStore(dimensions=2)
+    store.replace_document("doc", [span(0, "durable metadata")], [[1, 0]])
+
+    store.delete_document("doc")
+    store.delete_document("doc")
+
+    assert store.search([1, 0]) == []
+    assert store.lexical_search("durable metadata") == []
+
+
 def test_invalid_replacement_does_not_mutate_existing_document() -> None:
     store = InMemoryVectorStore(dimensions=2)
     store.replace_document("doc", [span(0, "original")], [[1, 0]])
@@ -139,6 +150,8 @@ def test_invalid_query_limit_and_document_id_are_rejected() -> None:
         store.lexical_search("query", document_id=" ")
     with pytest.raises(ValueError, match="document_id"):
         store.replace_document(" ", [], [])
+    with pytest.raises(ValueError, match="document_id"):
+        store.delete_document(" ")
 
 
 def test_builder_keeps_key_free_local_store_without_database() -> None:

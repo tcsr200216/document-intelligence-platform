@@ -18,6 +18,7 @@ HTTP upload -> validate -> parse text/PDF -> page-bounded chunks with exact offs
                                     -> DocumentRepository (memory or PostgreSQL)
 HTTP search -> embed query -> semantic + lexical ranks -> RRF -> traceable source spans
 HTTP question -> hybrid retrieval -> grounded answer -> only validated source citations
+HTTP delete -> remove vectors -> remove metadata/chunks -> verify source is no longer retrievable
 ```
 
 See `docs/architecture/` for the recorded decisions and tradeoffs. The current
@@ -48,6 +49,14 @@ traffic and latency, ingestion stages and duration, chunk counts, retrieval outc
 result counts, cache outcomes, and grounded-answer outcomes. Labels use route templates, document
 format, operation, provider, and finite outcome values; filenames, document IDs,
 questions, chunk text, and exception messages are never labels.
+
+Document deletion is available through `DELETE /documents/{document_id}`. Retrieval
+vectors are removed before metadata and citation chunks, so a successful or partially
+completed deletion cannot leave searchable evidence pointing at a missing source.
+Failed indexing compensates by deleting metadata persisted earlier in the upload flow.
+Both operations are idempotent at their storage boundaries and emit bounded lifecycle
+metrics. See
+[ADR-003](docs/architecture/ADR-003-ingestion-retrieval-orchestration.md).
 
 ## Run locally
 
@@ -144,6 +153,8 @@ curl -fsS http://localhost:8000/documents/YOUR_DOCUMENT_ID
 curl -fsS -X POST http://localhost:8000/search \
   -H "Content-Type: application/json" \
   -d '{"query":"Where is metadata stored?","document_id":"YOUR_DOCUMENT_ID","limit":3}'
+# Remove the document from retrieval and durable citation storage:
+curl -fsS -X DELETE http://localhost:8000/documents/YOUR_DOCUMENT_ID
 ```
 
 Supported formats are UTF-8 `.txt`/`.md` and text-based `.pdf` files up to 10 MB.
@@ -158,7 +169,7 @@ an explicit validation error instead of being indexed as empty content. See
 lexical/vector fusion, repository storage, and HTTP ingestion/search. The GitHub Actions
 workflow compiles Python sources, runs lint and tests, builds the image, launches the
 API with PostgreSQL/pgvector, and runs the complete PDF upload → persistence → retrieval
-→ cited Q&A flow before and after an API restart. CI passing does not prove cloud
+→ cited Q&A → restart → deletion flow. CI passing does not prove cloud
 deployment or OCR support.
 
 ## Deploy

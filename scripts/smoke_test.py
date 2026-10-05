@@ -94,11 +94,26 @@ def verify_document(
     return len(hits), len(answer["citations"])
 
 
+def verify_deletion(client: httpx.Client, document_id: str, query: str) -> None:
+    deleted = client.delete(f"/documents/{document_id}")
+    deleted.raise_for_status()
+    assert deleted.status_code == 204 and not deleted.content
+    assert client.get(f"/documents/{document_id}").status_code == 404
+
+    search = client.post(
+        "/search",
+        json={"query": query, "document_id": document_id, "limit": 3},
+    )
+    search.raise_for_status()
+    assert search.json() == []
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_url", nargs="?", default="http://127.0.0.1:8000")
     parser.add_argument("--document-id-output", type=Path)
     parser.add_argument("--verify-document-id-file", type=Path)
+    parser.add_argument("--delete-after-verify", action="store_true")
     args = parser.parse_args()
     sample = build_sample_pdf()
     with httpx.Client(base_url=args.base_url.rstrip("/"), timeout=15.0) as client:
@@ -130,6 +145,9 @@ def main() -> None:
 
         hit_count, citation_count = verify_document(client, document_id, sample)
 
+        if args.delete_after_verify:
+            verify_deletion(client, document_id, "document metadata citation spans")
+
         metrics = client.get("/metrics")
         metrics.raise_for_status()
         assert "document_intelligence_http_requests_total" in metrics.text
@@ -143,6 +161,8 @@ def main() -> None:
             in metrics.text
         )
         assert document_id not in metrics.text
+        if args.delete_after_verify:
+            assert "document_intelligence_document_deletions_total" in metrics.text
 
     print(
         f"Smoke test passed: document {document_id}, "

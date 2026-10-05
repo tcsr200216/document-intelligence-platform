@@ -35,6 +35,10 @@ def test_memory_repository_round_trips_exact_chunk_offsets() -> None:
     assert repository.get("missing") is None
     assert repository.is_ready() is True
 
+    assert repository.delete(source.document_id) is True
+    assert repository.delete(source.document_id) is False
+    assert repository.get(source.document_id) is None
+
 
 def test_sql_repository_round_trips_and_replaces_chunks_atomically() -> None:
     repository = SqlDocumentRepository(create_engine("sqlite+pysqlite:///:memory:"))
@@ -81,3 +85,13 @@ def test_sql_repository_returns_none_for_unknown_document() -> None:
     repository.create_schema()
 
     assert repository.get("missing") is None
+
+
+def test_sql_repository_delete_removes_document_and_chunks_idempotently() -> None:
+    repository = SqlDocumentRepository(create_engine("sqlite+pysqlite:///:memory:"))
+    repository.create_schema()
+    repository.save(record())
+
+    assert repository.delete("doc-1") is True
+    assert repository.delete("doc-1") is False
+    assert repository.get("doc-1") is None

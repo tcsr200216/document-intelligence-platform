@@ -45,7 +45,7 @@ jobs:
         run: |
           docker compose restart api
           docker compose up --detach --wait
-          python scripts/smoke_test.py --verify-document-id-file /tmp/document-id
+          python scripts/smoke_test.py --verify-document-id-file /tmp/document-id --delete-after-verify
       - name: Show container logs on failure
         if: failure()
         run: docker compose logs --no-color

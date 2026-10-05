@@ -5,6 +5,7 @@ from conftest import build_text_pdf
 from fastapi.testclient import TestClient
 from prometheus_client.parser import text_string_to_metric_families
 from redis.exceptions import RedisError
+from sqlalchemy.exc import SQLAlchemyError
 
 from app import main
 from app.answering import ExtractiveAnswerGenerator
@@ -135,6 +136,68 @@ def test_get_document_returns_404_for_unknown_id(monkeypatch) -> None:
     response = client.get("/documents/missing")
 
     assert response.status_code == 404
+
+
+def test_delete_document_removes_metadata_vectors_and_cited_context(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+    document = client.post(
+        "/documents/upload",
+        files={"file": ("delete.txt", b"PostgreSQL stores metadata.", "text/plain")},
+    ).json()
+
+    deleted = client.delete(f"/documents/{document['document_id']}")
+
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+    assert client.get(f"/documents/{document['document_id']}").status_code == 404
+    search = client.post(
+        "/search",
+        json={"query": "metadata", "document_id": document["document_id"]},
+    )
+    assert search.status_code == 200
+    assert search.json() == []
+    question = client.post(
+        "/questions",
+        json={"question": "Where is metadata?", "document_id": document["document_id"]},
+    )
+    assert question.status_code == 200
+    assert question.json()["status"] == "insufficient_context"
+    assert question.json()["citations"] == []
+
+
+def test_delete_unknown_document_returns_404(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+    response = client.delete("/documents/missing")
+    assert response.status_code == 404
+
+
+def test_index_failure_compensates_persisted_metadata(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    class TrackingRepository(InMemoryDocumentRepository):
+        last_saved_id: str | None = None
+
+        def save(self, record):
+            self.last_saved_id = record.document_id
+            super().save(record)
+
+    repository = TrackingRepository()
+
+    class FailingVectorStore(InMemoryVectorStore):
+        def replace_document(self, document_id, chunks, vectors):
+            raise SQLAlchemyError("index unavailable")
+
+    monkeypatch.setattr(main, "document_repository", repository)
+    monkeypatch.setattr(main, "vector_store", FailingVectorStore(dimensions=64))
+
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("rollback.txt", b"durable source", "text/plain")},
+    )
+
+    assert response.status_code == 503
+    assert repository.last_saved_id is not None
+    assert repository.get(repository.last_saved_id) is None
 
 
 def test_pdf_upload_enters_retrieval_and_cited_question_flow(monkeypatch) -> None:

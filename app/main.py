@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from pydantic import BaseModel, Field
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
@@ -18,6 +18,7 @@ from app.config import settings
 from app.embeddings import EmbeddingProviderError, build_embedder
 from app.observability import (
     ANSWER_OUTCOMES,
+    DOCUMENT_DELETIONS,
     EMBEDDING_CACHE_OPERATIONS,
     INGESTED_CHUNKS,
     INGESTION_DURATION,
@@ -286,6 +287,12 @@ async def upload_document(file: Annotated[UploadFile, File(...)]) -> DocumentUpl
         vector_store.replace_document(document_id, chunks, vectors)
     except SQLAlchemyError as exc:
         INGESTION_STAGES.labels("index", "error", document_format).inc()
+        try:
+            document_repository.delete(document_id)
+        except SQLAlchemyError:
+            INGESTION_STAGES.labels("rollback", "error", document_format).inc()
+        else:
+            INGESTION_STAGES.labels("rollback", "success", document_format).inc()
         raise HTTPException(status_code=503, detail="Vector store is unavailable.") from exc
     INGESTION_STAGES.labels("index", "success", document_format).inc()
     INGESTION_STAGES.labels("completed", "success", document_format).inc()
@@ -324,6 +331,41 @@ async def get_document(document_id: str) -> DocumentDetailResponse:
         character_count=record.character_count,
         chunk_count=len(record.chunks),
     )
+
+
+@app.delete(
+    "/documents/{document_id}",
+    status_code=204,
+    tags=["documents"],
+)
+async def delete_document(document_id: str) -> Response:
+    """Remove retrieval vectors first, then their durable citation source."""
+    try:
+        record = document_repository.get(document_id)
+    except SQLAlchemyError as exc:
+        DOCUMENT_DELETIONS.labels("metadata_error").inc()
+        raise HTTPException(status_code=503, detail="Document repository is unavailable.") from exc
+    if record is None:
+        DOCUMENT_DELETIONS.labels("not_found").inc()
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    try:
+        vector_store.delete_document(document_id)
+    except SQLAlchemyError as exc:
+        DOCUMENT_DELETIONS.labels("vector_error").inc()
+        raise HTTPException(status_code=503, detail="Vector store is unavailable.") from exc
+
+    try:
+        document_repository.delete(document_id)
+    except SQLAlchemyError as exc:
+        DOCUMENT_DELETIONS.labels("metadata_error").inc()
+        raise HTTPException(
+            status_code=503,
+            detail="Document vectors were removed; retry metadata deletion.",
+        ) from exc
+
+    DOCUMENT_DELETIONS.labels("success").inc()
+    return Response(status_code=204)
 
 
 @app.post("/search", response_model=list[SearchResult], tags=["retrieval"])

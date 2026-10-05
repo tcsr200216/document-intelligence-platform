@@ -92,6 +92,10 @@ class VectorStore(Protocol):
         """Find source spans containing the query's lexical evidence."""
         ...
 
+    def delete_document(self, document_id: str) -> None:
+        """Idempotently remove every indexed chunk for one document."""
+        ...
+
 
 _LEXICAL_TOKEN = re.compile(r"[\w]+", re.UNICODE)
 
@@ -242,6 +246,11 @@ class InMemoryVectorStore:
             hits,
             key=lambda hit: (-hit.score, hit.document_id, hit.chunk.index),
         )[:limit]
+
+    def delete_document(self, document_id: str) -> None:
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id must not be empty.")
+        self._documents.pop(document_id, None)
 
 
 class PgVectorStore:
@@ -499,6 +508,17 @@ class PgVectorStore:
             )
             for row in rows
         ]
+
+    def delete_document(self, document_id: str) -> None:
+        if not document_id or not document_id.strip():
+            raise ValueError("document_id must not be empty.")
+        with self._engine.begin() as connection:
+            connection.execute(
+                delete(self._vectors).where(
+                    self._vectors.c.document_id == document_id,
+                    self._vectors.c.model_version == self._model_version,
+                )
+            )
 
     def is_ready(self) -> bool:
         try:

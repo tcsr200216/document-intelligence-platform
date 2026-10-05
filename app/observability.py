@@ -59,6 +59,11 @@ EMBEDDING_CACHE_OPERATIONS = Counter(
     "Query embedding cache operations by outcome.",
     ("operation", "outcome"),
 )
+DOCUMENT_DELETIONS = Counter(
+    "document_intelligence_document_deletions_total",
+    "Document deletion outcomes across vector and metadata stores.",
+    ("outcome",),
+)
 
 _UNMEASURED_PATHS = frozenset({"/health", "/ready", "/metrics"})
 
