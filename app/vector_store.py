@@ -19,8 +19,8 @@ from sqlalchemy import (
     Text,
     create_engine,
     delete,
-    insert,
     func,
+    insert,
     select,
     text,
 )

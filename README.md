@@ -18,6 +18,7 @@ HTTP upload -> validate -> parse text/PDF -> page-bounded chunks with exact offs
                                     -> DocumentRepository (memory or PostgreSQL)
 HTTP search -> embed query -> semantic + lexical ranks -> RRF -> traceable source spans
 HTTP question -> hybrid retrieval -> grounded answer -> only validated source citations
+HTTP inventory -> filter status -> stable opaque cursor pages over durable metadata
 HTTP delete -> remove vectors -> remove metadata/chunks -> verify source is no longer retrievable
 ```
 
@@ -66,6 +67,14 @@ document per digest, and an `indexing` → `indexed` publication state prevents 
 request from claiming incomplete vectors are ready. A concurrent retry receives `409`
 with the in-progress document ID so it can poll `GET /documents/{document_id}`. See
 [ADR-013](docs/architecture/ADR-013-content-addressed-idempotent-ingestion.md).
+
+Durable document discovery is available through `GET /documents`. Results use descending
+upload time plus document ID for deterministic keyset pagination, and can be filtered by
+`status_filter=indexed` or `status_filter=indexing`. The opaque `next_cursor` is bound to
+the chosen filter, so clients cannot accidentally continue a page under different query
+semantics. This avoids increasingly expensive and unstable offset scans as documents are
+added concurrently. See
+[ADR-014](docs/architecture/ADR-014-keyset-document-inventory.md).
 
 ## Run locally
 
@@ -160,6 +169,7 @@ curl -fsS -F "file=@data/sample_document.txt;type=text/plain" \
 # Repeating this upload returns HTTP 200 and the same document_id without re-embedding.
 # From the JSON response, copy document_id:
 curl -fsS http://localhost:8000/documents/YOUR_DOCUMENT_ID
+curl -fsS 'http://localhost:8000/documents?limit=25&status_filter=indexed'
 curl -fsS -X POST http://localhost:8000/search \
   -H "Content-Type: application/json" \
   -d '{"query":"Where is metadata stored?","document_id":"YOUR_DOCUMENT_ID","limit":3}'

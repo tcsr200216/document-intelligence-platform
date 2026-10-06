@@ -47,6 +47,9 @@ def verify_document(client: httpx.Client, document_id: str, sample: bytes) -> tu
     detail = client.get(f"/documents/{document_id}")
     detail.raise_for_status()
     assert detail.json()["sha256"] == hashlib.sha256(sample).hexdigest()
+    inventory = client.get("/documents", params={"limit": 100, "status_filter": "indexed"})
+    inventory.raise_for_status()
+    assert document_id in {item["document_id"] for item in inventory.json()["items"]}
     query = f"Where are document metadata and citation spans stored? smoke-verification-{uuid4()}"
 
     response = client.post(
@@ -166,7 +169,8 @@ def main() -> None:
 
     print(
         f"Smoke test passed: document {document_id}, "
-        f"{hit_count} search hit(s), {citation_count} answer citation(s)."
+        f"inventory discovery, {hit_count} search hit(s), "
+        f"{citation_count} answer citation(s)."
     )
 
 

@@ -4,10 +4,10 @@ import hashlib
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field
 from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
@@ -28,6 +28,11 @@ from app.observability import (
     RETRIEVAL_RESULTS,
     HttpObservabilityMiddleware,
     metrics_response,
+)
+from app.pagination import (
+    InvalidDocumentCursor,
+    decode_document_cursor,
+    encode_document_cursor,
 )
 from app.parsing import DocumentParseError, chunk_document, parse_document
 from app.repository import (
@@ -98,6 +103,11 @@ class DocumentDetailResponse(BaseModel):
     character_count: int
     chunk_count: int
     status: str
+
+
+class DocumentListResponse(BaseModel):
+    items: list[DocumentDetailResponse]
+    next_cursor: str | None
 
 
 class SearchRequest(BaseModel):
@@ -383,6 +393,50 @@ def _upload_response(record: DocumentRecord, status_value: str) -> DocumentUploa
         uploaded_at=record.uploaded_at,
         character_count=record.character_count,
         chunk_count=len(record.chunks),
+    )
+
+
+@app.get("/documents", response_model=DocumentListResponse, tags=["documents"])
+async def list_documents(
+    limit: int = Query(default=25, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=512),
+    status_filter: Literal["indexing", "indexed"] | None = Query(default=None),
+) -> DocumentListResponse:
+    """List durable document metadata with stable keyset pagination."""
+    try:
+        decoded_cursor = (
+            decode_document_cursor(cursor, status_filter) if cursor is not None else None
+        )
+    except InvalidDocumentCursor as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        page = document_repository.list_page(
+            limit=limit,
+            cursor=decoded_cursor,
+            status=status_filter,
+        )
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Document repository is unavailable.") from exc
+    return DocumentListResponse(
+        items=[
+            DocumentDetailResponse(
+                document_id=item.document_id,
+                filename=item.filename,
+                content_type=item.content_type,
+                size_bytes=item.size_bytes,
+                sha256=item.sha256,
+                uploaded_at=item.uploaded_at,
+                character_count=item.character_count,
+                chunk_count=item.chunk_count,
+                status=item.status,
+            )
+            for item in page.items
+        ],
+        next_cursor=(
+            encode_document_cursor(page.next_cursor, status_filter)
+            if page.next_cursor is not None
+            else None
+        ),
     )
 
 

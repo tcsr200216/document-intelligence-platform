@@ -1,5 +1,5 @@
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -144,3 +144,33 @@ def test_sql_repository_delete_removes_document_and_chunks_idempotently() -> Non
     assert repository.delete("doc-1") is True
     assert repository.delete("doc-1") is False
     assert repository.get("doc-1") is None
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        InMemoryDocumentRepository(),
+        SqlDocumentRepository(create_engine("sqlite+pysqlite:///:memory:")),
+    ],
+)
+def test_repository_lists_stable_cursor_pages_with_status_filter(repository) -> None:
+    if isinstance(repository, SqlDocumentRepository):
+        repository.create_schema()
+    base_time = datetime(2026, 10, 5, 20, 0, tzinfo=UTC)
+    for index, status in ((1, "indexed"), (2, "indexing"), (3, "indexed"), (4, "indexed")):
+        source = replace(
+            record(f"doc-{index}"),
+            sha256=f"{index:064x}",
+            uploaded_at=base_time + timedelta(minutes=index // 2),
+            status=status,
+        )
+        repository.save(source)
+
+    first = repository.list_page(limit=2, status="indexed")
+    second = repository.list_page(limit=2, cursor=first.next_cursor, status="indexed")
+
+    assert [item.document_id for item in first.items] == ["doc-4", "doc-3"]
+    assert first.next_cursor is not None
+    assert [item.document_id for item in second.items] == ["doc-1"]
+    assert second.next_cursor is None
+    assert all(item.status == "indexed" and item.chunk_count == 1 for item in first.items)

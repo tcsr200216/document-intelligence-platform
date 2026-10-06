@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from sqlalchemy import (
@@ -16,7 +16,9 @@ from sqlalchemy import (
     Text,
     create_engine,
     delete,
+    func,
     insert,
+    or_,
     select,
     text,
 )
@@ -39,6 +41,31 @@ class DocumentRecord:
     status: str = "indexed"
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentSummary:
+    document_id: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    uploaded_at: datetime
+    character_count: int
+    chunk_count: int
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentCursor:
+    uploaded_at: datetime
+    document_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentPage:
+    items: tuple[DocumentSummary, ...]
+    next_cursor: DocumentCursor | None
+
+
 class DuplicateDocumentError(ValueError):
     """Raised when another document already owns a content digest."""
 
@@ -58,6 +85,13 @@ class DocumentRepository(Protocol):
     def get(self, document_id: str) -> DocumentRecord | None: ...
 
     def get_by_sha256(self, sha256: str) -> DocumentRecord | None: ...
+
+    def list_page(
+        self,
+        limit: int,
+        cursor: DocumentCursor | None = None,
+        status: str | None = None,
+    ) -> DocumentPage: ...
 
     def mark_indexed(self, document_id: str) -> None:
         """Publish a persisted document after its vectors are durable."""
@@ -99,6 +133,38 @@ class InMemoryDocumentRepository:
             (document for document in self._documents.values() if document.sha256 == sha256),
             None,
         )
+
+    def list_page(
+        self,
+        limit: int,
+        cursor: DocumentCursor | None = None,
+        status: str | None = None,
+    ) -> DocumentPage:
+        records = sorted(
+            (
+                record
+                for record in self._documents.values()
+                if status is None or record.status == status
+            ),
+            key=lambda record: (record.uploaded_at, record.document_id),
+            reverse=True,
+        )
+        if cursor is not None:
+            cursor_key = (cursor.uploaded_at, cursor.document_id)
+            records = [
+                record
+                for record in records
+                if (record.uploaded_at, record.document_id) < cursor_key
+            ]
+        window = records[: limit + 1]
+        visible = window[:limit]
+        items = tuple(_summary_from_record(record) for record in visible)
+        next_cursor = (
+            DocumentCursor(visible[-1].uploaded_at, visible[-1].document_id)
+            if len(window) > limit
+            else None
+        )
+        return DocumentPage(items=items, next_cursor=next_cursor)
 
     def mark_indexed(self, document_id: str) -> None:
         record = self._documents.get(document_id)
@@ -241,6 +307,68 @@ class SqlDocumentRepository:
     def get_by_sha256(self, sha256: str) -> DocumentRecord | None:
         return self._get_one(documents_table.c.sha256 == sha256)
 
+    def list_page(
+        self,
+        limit: int,
+        cursor: DocumentCursor | None = None,
+        status: str | None = None,
+    ) -> DocumentPage:
+        statement = select(documents_table).order_by(
+            documents_table.c.uploaded_at.desc(),
+            documents_table.c.document_id.desc(),
+        )
+        if status is not None:
+            statement = statement.where(documents_table.c.status == status)
+        if cursor is not None:
+            cursor_time = cursor.uploaded_at
+            if self._engine.dialect.name == "sqlite":
+                cursor_time = cursor_time.replace(tzinfo=None)
+            statement = statement.where(
+                or_(
+                    documents_table.c.uploaded_at < cursor_time,
+                    (
+                        (documents_table.c.uploaded_at == cursor_time)
+                        & (documents_table.c.document_id < cursor.document_id)
+                    ),
+                )
+            )
+        with self._engine.connect() as connection:
+            rows = connection.execute(statement.limit(limit + 1)).mappings().all()
+            visible = rows[:limit]
+            document_ids = [row["document_id"] for row in visible]
+            chunk_counts = {}
+            if document_ids:
+                chunk_counts = dict(
+                    connection.execute(
+                        select(
+                            chunks_table.c.document_id,
+                            func.count(chunks_table.c.chunk_index),
+                        )
+                        .where(chunks_table.c.document_id.in_(document_ids))
+                        .group_by(chunks_table.c.document_id)
+                    ).all()
+                )
+        items = tuple(
+            DocumentSummary(
+                document_id=row["document_id"],
+                filename=row["filename"],
+                content_type=row["content_type"],
+                size_bytes=row["size_bytes"],
+                sha256=row["sha256"],
+                uploaded_at=_as_utc(row["uploaded_at"]),
+                character_count=row["character_count"],
+                chunk_count=chunk_counts.get(row["document_id"], 0),
+                status=row["status"],
+            )
+            for row in visible
+        )
+        next_cursor = (
+            DocumentCursor(items[-1].uploaded_at, items[-1].document_id)
+            if len(rows) > limit
+            else None
+        )
+        return DocumentPage(items=items, next_cursor=next_cursor)
+
     def _get_one(self, predicate) -> DocumentRecord | None:
         with self._engine.connect() as connection:
             document = (
@@ -317,3 +445,21 @@ def build_document_repository(database_url: str | None) -> DocumentRepository:
     repository = SqlDocumentRepository.from_url(database_url)
     repository.create_schema()
     return repository
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _summary_from_record(record: DocumentRecord) -> DocumentSummary:
+    return DocumentSummary(
+        document_id=record.document_id,
+        filename=record.filename,
+        content_type=record.content_type,
+        size_bytes=record.size_bytes,
+        sha256=record.sha256,
+        uploaded_at=record.uploaded_at,
+        character_count=record.character_count,
+        chunk_count=len(record.chunks),
+        status=record.status,
+    )

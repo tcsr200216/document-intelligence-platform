@@ -197,6 +197,54 @@ def test_get_document_returns_404_for_unknown_id(monkeypatch) -> None:
     assert response.status_code == 404
 
 
+def test_document_inventory_is_cursor_paginated_and_filter_bound(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+    repository = main.document_repository
+    uploaded_at = datetime(2026, 10, 5, 20, 0, tzinfo=UTC)
+    for index, status_value in ((1, "indexed"), (2, "indexing"), (3, "indexed")):
+        repository.save(
+            DocumentRecord(
+                document_id=f"doc-{index}",
+                filename=f"document-{index}.txt",
+                content_type="text/plain",
+                size_bytes=10,
+                sha256=f"{index:064x}",
+                uploaded_at=uploaded_at,
+                character_count=10,
+                chunks=(),
+                status=status_value,
+            )
+        )
+
+    first = client.get("/documents?limit=1&status_filter=indexed")
+    assert first.status_code == 200
+    assert [item["document_id"] for item in first.json()["items"]] == ["doc-3"]
+    cursor = first.json()["next_cursor"]
+    assert cursor
+
+    second = client.get(
+        "/documents",
+        params={"limit": 1, "status_filter": "indexed", "cursor": cursor},
+    )
+    assert second.status_code == 200
+    assert [item["document_id"] for item in second.json()["items"]] == ["doc-1"]
+    assert second.json()["next_cursor"] is None
+
+    mismatch = client.get(
+        "/documents",
+        params={"limit": 1, "status_filter": "indexing", "cursor": cursor},
+    )
+    assert mismatch.status_code == 400
+
+
+def test_document_inventory_rejects_invalid_cursor(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    response = client.get("/documents?cursor=not-a-valid-cursor")
+
+    assert response.status_code == 400
+
+
 def test_delete_document_removes_metadata_vectors_and_cited_context(monkeypatch) -> None:
     client = fresh_client(monkeypatch)
     document = client.post(
