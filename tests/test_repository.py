@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.parsing import TextChunk
 from app.repository import (
@@ -144,6 +145,44 @@ def test_sql_repository_delete_removes_document_and_chunks_idempotently() -> Non
     assert repository.delete("doc-1") is True
     assert repository.delete("doc-1") is False
     assert repository.get("doc-1") is None
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        InMemoryDocumentRepository(),
+        SqlDocumentRepository(create_engine("sqlite+pysqlite:///:memory:")),
+    ],
+)
+def test_repository_fences_indexing_leases_and_releases_exact_owner(repository) -> None:
+    if isinstance(repository, SqlDocumentRepository):
+        repository.create_schema()
+    now = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    first_lease = now + timedelta(minutes=5)
+    second_lease = now + timedelta(minutes=10)
+    repository.save(
+        replace(
+            record(),
+            status="indexing",
+            indexing_lease_until=now - timedelta(seconds=1),
+        )
+    )
+
+    assert repository.try_claim_indexing("doc-1", now=now, lease_until=first_lease) is True
+    assert repository.try_claim_indexing("doc-1", now=now, lease_until=second_lease) is False
+
+    repository.release_indexing_claim("doc-1", second_lease)
+    assert repository.get("doc-1").indexing_lease_until == first_lease
+    with pytest.raises(SQLAlchemyError):
+        repository.mark_indexed("doc-1", indexing_lease_until=second_lease)
+
+    repository.release_indexing_claim("doc-1", first_lease)
+    assert repository.try_claim_indexing("doc-1", now=now, lease_until=second_lease) is True
+    repository.mark_indexed("doc-1", indexing_lease_until=second_lease)
+    published = repository.get("doc-1")
+    assert published.status == "indexed"
+    assert published.indexing_lease_until is None
+    assert repository.try_claim_indexing("doc-1", now=now, lease_until=first_lease) is False
 
 
 @pytest.mark.parametrize(

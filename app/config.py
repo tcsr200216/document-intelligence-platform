@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     redis_url: str | None = None
     embedding_cache_ttl_seconds: int = Field(default=300, ge=1, le=86_400)
     embedding_cache_namespace: str = "query-embeddings:v1"
+    indexing_lease_seconds: int = Field(default=300, ge=30, le=86_400)
     embedding_provider: Literal["hashing", "openai"] = "hashing"
     embedding_dimensions: int = Field(default=256, ge=1, le=3_072)
     openai_api_key: SecretStr | None = None

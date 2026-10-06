@@ -65,7 +65,12 @@ successful upload returns `201` with `status: indexed`; an identical retry retur
 embedding again—even if the retry uses a different filename. PostgreSQL enforces one
 document per digest, and an `indexing` → `indexed` publication state prevents a racing
 request from claiming incomplete vectors are ready. A concurrent retry receives `409`
-with the in-progress document ID so it can poll `GET /documents/{document_id}`. See
+with the in-progress document ID so it can poll `GET /documents/{document_id}`. Each
+indexing owner holds a bounded lease. After `INDEXING_LEASE_SECONDS` (five minutes by
+default), an identical retry can atomically reclaim work left by a crashed request,
+rebuild vectors from the already-persisted chunks, and return `200` with
+`status: recovered_indexed`. Lease fencing prevents the expired owner from publishing
+after another replica has taken over. See
 [ADR-013](docs/architecture/ADR-013-content-addressed-idempotent-ingestion.md).
 
 Durable document discovery is available through `GET /documents`. Results use descending
@@ -167,6 +172,7 @@ the local database volume. Never use example credentials for a public deployment
 curl -fsS -F "file=@data/sample_document.txt;type=text/plain" \
   http://localhost:8000/documents/upload
 # Repeating this upload returns HTTP 200 and the same document_id without re-embedding.
+# If a previous request crashed while indexing, a retry reclaims it after its lease expires.
 # From the JSON response, copy document_id:
 curl -fsS http://localhost:8000/documents/YOUR_DOCUMENT_ID
 curl -fsS 'http://localhost:8000/documents?limit=25&status_filter=indexed'

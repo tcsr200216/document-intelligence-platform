@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from conftest import build_text_pdf
@@ -13,7 +13,12 @@ from app import main
 from app.answering import ExtractiveAnswerGenerator
 from app.cache import InMemoryEmbeddingCache
 from app.embeddings import HashingEmbedder
-from app.repository import DocumentRecord, InMemoryDocumentRepository
+from app.parsing import TextChunk
+from app.repository import (
+    DocumentRecord,
+    IndexingLeaseLostError,
+    InMemoryDocumentRepository,
+)
 from app.vector_store import InMemoryVectorStore
 
 
@@ -115,6 +120,7 @@ def test_duplicate_upload_reports_in_progress_before_embedding(monkeypatch) -> N
             character_count=len(payload),
             chunks=(),
             status="indexing",
+            indexing_lease_until=datetime.now(UTC) + timedelta(minutes=5),
         )
     )
     monkeypatch.setattr(main, "document_repository", repository)
@@ -126,6 +132,89 @@ def test_duplicate_upload_reports_in_progress_before_embedding(monkeypatch) -> N
 
     assert response.status_code == 409
     assert response.json()["detail"]["document_id"] == "in-progress-document"
+
+
+def test_expired_ingestion_is_recovered_from_persisted_chunks(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+    payload = b"Persisted chunks let another replica resume after a crash."
+    repository = InMemoryDocumentRepository()
+    repository.save(
+        DocumentRecord(
+            document_id="recoverable-document",
+            filename="original.txt",
+            content_type="text/plain",
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            uploaded_at=datetime.now(UTC) - timedelta(minutes=10),
+            character_count=len(payload),
+            chunks=(
+                TextChunk(
+                    index=0,
+                    text=payload.decode(),
+                    start_char=0,
+                    end_char=len(payload),
+                ),
+            ),
+            status="indexing",
+            indexing_lease_until=datetime.now(UTC) - timedelta(minutes=1),
+        )
+    )
+    monkeypatch.setattr(main, "document_repository", repository)
+
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("retry.txt", payload, "text/plain")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "recovered_indexed"
+    assert response.json()["document_id"] == "recoverable-document"
+    recovered = repository.get("recoverable-document")
+    assert recovered is not None
+    assert recovered.status == "indexed"
+    assert recovered.indexing_lease_until is None
+    search = client.post("/search", json={"query": "resume after crash"})
+    assert search.status_code == 200
+    assert search.json()[0]["document_id"] == "recoverable-document"
+
+
+def test_failed_recovery_embedding_releases_exact_lease(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+    payload = b"Recovery should be retryable after a provider outage."
+    repository = InMemoryDocumentRepository()
+    repository.save(
+        DocumentRecord(
+            document_id="retryable-document",
+            filename="original.txt",
+            content_type="text/plain",
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            uploaded_at=datetime.now(UTC) - timedelta(minutes=10),
+            character_count=len(payload),
+            chunks=(TextChunk(0, payload.decode(), 0, len(payload)),),
+            status="indexing",
+        )
+    )
+
+    class FailingEmbedder(HashingEmbedder):
+        def embed(self, texts):
+            from app.embeddings import EmbeddingProviderError
+
+            raise EmbeddingProviderError("provider unavailable")
+
+    monkeypatch.setattr(main, "document_repository", repository)
+    monkeypatch.setattr(main, "embedder", FailingEmbedder(dimensions=64))
+
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("retry.txt", payload, "text/plain")},
+    )
+
+    assert response.status_code == 503
+    retryable = repository.get("retryable-document")
+    assert retryable is not None
+    assert retryable.status == "indexing"
+    assert retryable.indexing_lease_until is None
 
 
 def test_search_can_be_scoped_to_uploaded_document(monkeypatch) -> None:
@@ -317,7 +406,7 @@ def test_publish_failure_removes_vectors_and_incomplete_metadata(monkeypatch) ->
             self.last_saved_id = record.document_id
             super().save(record)
 
-        def mark_indexed(self, document_id):
+        def mark_indexed(self, document_id, indexing_lease_until=None):
             raise SQLAlchemyError("publish unavailable")
 
     repository = FailingPublishRepository()
@@ -334,6 +423,34 @@ def test_publish_failure_removes_vectors_and_incomplete_metadata(monkeypatch) ->
     assert repository.last_saved_id is not None
     assert repository.get(repository.last_saved_id) is None
     assert store.search([1.0] + [0.0] * 63, document_id=repository.last_saved_id) == []
+
+
+def test_lost_publication_lease_does_not_delete_replacement_owners_state(monkeypatch) -> None:
+    client = fresh_client(monkeypatch)
+
+    class LeaseLostRepository(InMemoryDocumentRepository):
+        last_saved_id: str | None = None
+
+        def save(self, record):
+            self.last_saved_id = record.document_id
+            super().save(record)
+
+        def mark_indexed(self, document_id, indexing_lease_until=None):
+            raise IndexingLeaseLostError("another worker owns the lease")
+
+    repository = LeaseLostRepository()
+    monkeypatch.setattr(main, "document_repository", repository)
+
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("lease-race.txt", b"shared recovery state", "text/plain")},
+    )
+
+    assert response.status_code == 409
+    assert repository.last_saved_id is not None
+    retained = repository.get(repository.last_saved_id)
+    assert retained is not None
+    assert retained.status == "indexing"
 
 
 def test_pdf_upload_enters_retrieval_and_cited_question_flow(monkeypatch) -> None:

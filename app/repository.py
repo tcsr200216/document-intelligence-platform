@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -39,6 +39,7 @@ class DocumentRecord:
     character_count: int
     chunks: tuple[TextChunk, ...]
     status: str = "indexed"
+    indexing_lease_until: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +75,10 @@ class DuplicateDocumentError(ValueError):
         self.sha256 = sha256
 
 
+class IndexingLeaseLostError(SQLAlchemyError):
+    """Raised when a worker no longer owns the document publication lease."""
+
+
 class DocumentRepository(Protocol):
     @property
     def backend(self) -> str: ...
@@ -93,8 +98,26 @@ class DocumentRepository(Protocol):
         status: str | None = None,
     ) -> DocumentPage: ...
 
-    def mark_indexed(self, document_id: str) -> None:
-        """Publish a persisted document after its vectors are durable."""
+    def mark_indexed(
+        self,
+        document_id: str,
+        indexing_lease_until: datetime | None = None,
+    ) -> None:
+        """Publish only when the caller still owns the indexing lease."""
+        ...
+
+    def try_claim_indexing(
+        self,
+        document_id: str,
+        *,
+        now: datetime,
+        lease_until: datetime,
+    ) -> bool:
+        """Atomically claim expired indexing work for crash recovery."""
+        ...
+
+    def release_indexing_claim(self, document_id: str, lease_until: datetime) -> None:
+        """Release only the caller's exact lease after pre-indexing failure."""
         ...
 
     def delete(self, document_id: str) -> bool:
@@ -166,21 +189,52 @@ class InMemoryDocumentRepository:
         )
         return DocumentPage(items=items, next_cursor=next_cursor)
 
-    def mark_indexed(self, document_id: str) -> None:
+    def mark_indexed(
+        self,
+        document_id: str,
+        indexing_lease_until: datetime | None = None,
+    ) -> None:
         record = self._documents.get(document_id)
         if record is None:
-            raise SQLAlchemyError("Document disappeared before indexing completed.")
-        self._documents[document_id] = DocumentRecord(
-            document_id=record.document_id,
-            filename=record.filename,
-            content_type=record.content_type,
-            size_bytes=record.size_bytes,
-            sha256=record.sha256,
-            uploaded_at=record.uploaded_at,
-            character_count=record.character_count,
-            chunks=record.chunks,
-            status="indexed",
+            raise IndexingLeaseLostError("Document disappeared before indexing completed.")
+        expected_lease = (
+            _as_utc(indexing_lease_until) if indexing_lease_until is not None else None
         )
+        if record.status != "indexing" or record.indexing_lease_until != expected_lease:
+            raise IndexingLeaseLostError("Document indexing lease is no longer owned.")
+        self._documents[document_id] = replace(
+            record,
+            status="indexed",
+            indexing_lease_until=None,
+        )
+
+    def try_claim_indexing(
+        self,
+        document_id: str,
+        *,
+        now: datetime,
+        lease_until: datetime,
+    ) -> bool:
+        record = self._documents.get(document_id)
+        if record is None or record.status != "indexing":
+            return False
+        current_lease = record.indexing_lease_until
+        if current_lease is not None and _as_utc(current_lease) > _as_utc(now):
+            return False
+        self._documents[document_id] = replace(
+            record,
+            indexing_lease_until=_as_utc(lease_until),
+        )
+        return True
+
+    def release_indexing_claim(self, document_id: str, lease_until: datetime) -> None:
+        record = self._documents.get(document_id)
+        if (
+            record is not None
+            and record.status == "indexing"
+            and record.indexing_lease_until == _as_utc(lease_until)
+        ):
+            self._documents[document_id] = replace(record, indexing_lease_until=None)
 
     def delete(self, document_id: str) -> bool:
         return self._documents.pop(document_id, None) is not None
@@ -201,6 +255,7 @@ documents_table = Table(
     Column("uploaded_at", DateTime(timezone=True), nullable=False),
     Column("character_count", Integer, nullable=False),
     Column("status", String(32), nullable=False, server_default="indexed"),
+    Column("indexing_lease_until", DateTime(timezone=True), nullable=True),
 )
 Index("uq_documents_sha256", documents_table.c.sha256, unique=True)
 chunks_table = Table(
@@ -250,6 +305,12 @@ class SqlDocumentRepository:
                 )
                 connection.execute(
                     text(
+                        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS "
+                        "indexing_lease_until TIMESTAMPTZ"
+                    )
+                )
+                connection.execute(
+                    text(
                         "CREATE UNIQUE INDEX IF NOT EXISTS uq_documents_sha256 "
                         "ON documents (sha256)"
                     )
@@ -280,6 +341,7 @@ class SqlDocumentRepository:
                         uploaded_at=record.uploaded_at,
                         character_count=record.character_count,
                         status=record.status,
+                        indexing_lease_until=record.indexing_lease_until,
                     )
                 )
                 if record.chunks:
@@ -408,17 +470,73 @@ class SqlDocumentRepository:
                 for row in rows
             ),
             status=document["status"],
+            indexing_lease_until=(
+                _as_utc(document["indexing_lease_until"])
+                if document["indexing_lease_until"] is not None
+                else None
+            ),
         )
 
-    def mark_indexed(self, document_id: str) -> None:
+    def mark_indexed(
+        self,
+        document_id: str,
+        indexing_lease_until: datetime | None = None,
+    ) -> None:
+        lease_condition = (
+            documents_table.c.indexing_lease_until.is_(None)
+            if indexing_lease_until is None
+            else documents_table.c.indexing_lease_until
+            == _sql_datetime(self._engine, indexing_lease_until)
+        )
         with self._engine.begin() as connection:
             result = connection.execute(
                 documents_table.update()
-                .where(documents_table.c.document_id == document_id)
-                .values(status="indexed")
+                .where(
+                    documents_table.c.document_id == document_id,
+                    documents_table.c.status == "indexing",
+                    lease_condition,
+                )
+                .values(status="indexed", indexing_lease_until=None)
             )
         if not result.rowcount:
-            raise SQLAlchemyError("Document disappeared before indexing completed.")
+            raise IndexingLeaseLostError("Document indexing lease is no longer owned.")
+
+    def try_claim_indexing(
+        self,
+        document_id: str,
+        *,
+        now: datetime,
+        lease_until: datetime,
+    ) -> bool:
+        comparison_time = _sql_datetime(self._engine, now)
+        stored_lease_until = _sql_datetime(self._engine, lease_until)
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                documents_table.update()
+                .where(
+                    documents_table.c.document_id == document_id,
+                    documents_table.c.status == "indexing",
+                    or_(
+                        documents_table.c.indexing_lease_until.is_(None),
+                        documents_table.c.indexing_lease_until <= comparison_time,
+                    ),
+                )
+                .values(indexing_lease_until=stored_lease_until)
+            )
+        return bool(result.rowcount)
+
+    def release_indexing_claim(self, document_id: str, lease_until: datetime) -> None:
+        stored_lease_until = _sql_datetime(self._engine, lease_until)
+        with self._engine.begin() as connection:
+            connection.execute(
+                documents_table.update()
+                .where(
+                    documents_table.c.document_id == document_id,
+                    documents_table.c.status == "indexing",
+                    documents_table.c.indexing_lease_until == stored_lease_until,
+                )
+                .values(indexing_lease_until=None)
+            )
 
     def delete(self, document_id: str) -> bool:
         with self._engine.begin() as connection:
@@ -449,6 +567,11 @@ def build_document_repository(database_url: str | None) -> DocumentRepository:
 
 def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _sql_datetime(engine: Engine, value: datetime) -> datetime:
+    normalized = _as_utc(value)
+    return normalized.replace(tzinfo=None) if engine.dialect.name == "sqlite" else normalized
 
 
 def _summary_from_record(record: DocumentRecord) -> DocumentSummary:

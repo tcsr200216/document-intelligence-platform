@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import time
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import uuid4
@@ -39,6 +40,7 @@ from app.repository import (
     DocumentRecord,
     DocumentRepository,
     DuplicateDocumentError,
+    IndexingLeaseLostError,
     build_document_repository,
 )
 from app.retrieval import HybridRetriever
@@ -273,7 +275,38 @@ async def upload_document(
         DOCUMENT_UPLOADS.labels("lookup_error", document_format).inc()
         raise HTTPException(status_code=503, detail="Document repository is unavailable.") from exc
     if existing is not None:
-        if existing.status != "indexed":
+        if existing.status == "indexed":
+            response.status_code = 200
+            DOCUMENT_UPLOADS.labels("deduplicated", document_format).inc()
+            return _upload_response(existing, "already_indexed")
+
+        now = datetime.now(UTC)
+        lease_until = now + timedelta(seconds=settings.indexing_lease_seconds)
+        try:
+            claimed = document_repository.try_claim_indexing(
+                existing.document_id,
+                now=now,
+                lease_until=lease_until,
+            )
+        except SQLAlchemyError as exc:
+            DOCUMENT_UPLOADS.labels("lookup_error", document_format).inc()
+            raise HTTPException(
+                status_code=503,
+                detail="Document repository is unavailable.",
+            ) from exc
+        if not claimed:
+            try:
+                current = document_repository.get(existing.document_id)
+            except SQLAlchemyError as exc:
+                DOCUMENT_UPLOADS.labels("lookup_error", document_format).inc()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Document repository is unavailable.",
+                ) from exc
+            if current is not None and current.status == "indexed":
+                response.status_code = 200
+                DOCUMENT_UPLOADS.labels("deduplicated", document_format).inc()
+                return _upload_response(current, "already_indexed")
             DOCUMENT_UPLOADS.labels("in_progress", document_format).inc()
             raise HTTPException(
                 status_code=409,
@@ -282,9 +315,35 @@ async def upload_document(
                     "document_id": existing.document_id,
                 },
             )
+
+        recovery_record = replace(existing, indexing_lease_until=lease_until)
+        try:
+            vectors = embedder.embed([chunk.text for chunk in recovery_record.chunks])
+        except EmbeddingProviderError as exc:
+            INGESTION_STAGES.labels("embed", "error", document_format).inc()
+            try:
+                document_repository.release_indexing_claim(
+                    recovery_record.document_id,
+                    lease_until,
+                )
+            except SQLAlchemyError:
+                INGESTION_STAGES.labels("rollback", "error", document_format).inc()
+            else:
+                INGESTION_STAGES.labels("rollback", "success", document_format).inc()
+            raise HTTPException(
+                status_code=503,
+                detail="Embedding provider is unavailable.",
+            ) from exc
+        INGESTION_STAGES.labels("embed", "success", document_format).inc()
+        _publish_document(recovery_record, vectors, document_format)
+        INGESTION_DURATION.labels(document_format).observe(time.perf_counter() - started)
+        INGESTED_CHUNKS.labels(document_format).observe(len(recovery_record.chunks))
         response.status_code = 200
-        DOCUMENT_UPLOADS.labels("deduplicated", document_format).inc()
-        return _upload_response(existing, "already_indexed")
+        DOCUMENT_UPLOADS.labels("recovered", document_format).inc()
+        return _upload_response(
+            replace(recovery_record, status="indexed", indexing_lease_until=None),
+            "recovered_indexed",
+        )
 
     try:
         parsed = parse_document(filename, payload)
@@ -316,6 +375,8 @@ async def upload_document(
             character_count=parsed.character_count,
             chunks=tuple(chunks),
             status="indexing",
+            indexing_lease_until=uploaded_at
+            + timedelta(seconds=settings.indexing_lease_seconds),
         )
         document_repository.save(record)
     except DuplicateDocumentError:
@@ -336,12 +397,29 @@ async def upload_document(
         INGESTION_STAGES.labels("persist", "error", document_format).inc()
         raise HTTPException(status_code=503, detail="Document repository is unavailable.") from exc
     INGESTION_STAGES.labels("persist", "success", document_format).inc()
+    _publish_document(record, vectors, document_format)
+    INGESTION_DURATION.labels(document_format).observe(time.perf_counter() - started)
+    INGESTED_CHUNKS.labels(document_format).observe(len(chunks))
+
+    DOCUMENT_UPLOADS.labels("indexed", document_format).inc()
+    return _upload_response(
+        replace(record, status="indexed", indexing_lease_until=None),
+        "indexed",
+    )
+
+
+def _publish_document(
+    record: DocumentRecord,
+    vectors: list[list[float]] | list[tuple[float, ...]],
+    document_format: str,
+) -> None:
+    """Publish vectors and transition metadata while fencing stale workers."""
     try:
-        vector_store.replace_document(document_id, chunks, vectors)
+        vector_store.replace_document(record.document_id, record.chunks, vectors)
     except SQLAlchemyError as exc:
         INGESTION_STAGES.labels("index", "error", document_format).inc()
         try:
-            document_repository.delete(document_id)
+            document_repository.delete(record.document_id)
         except SQLAlchemyError:
             INGESTION_STAGES.labels("rollback", "error", document_format).inc()
         else:
@@ -349,12 +427,23 @@ async def upload_document(
         raise HTTPException(status_code=503, detail="Vector store is unavailable.") from exc
     INGESTION_STAGES.labels("index", "success", document_format).inc()
     try:
-        document_repository.mark_indexed(document_id)
+        document_repository.mark_indexed(
+            record.document_id,
+            indexing_lease_until=record.indexing_lease_until,
+        )
+    except IndexingLeaseLostError as exc:
+        # A replacement worker may already own this document. Its metadata and
+        # identical content-addressed vectors must not be compensated away.
+        INGESTION_STAGES.labels("publish", "lease_lost", document_format).inc()
+        raise HTTPException(
+            status_code=409,
+            detail="Document ingestion ownership changed; retry the upload.",
+        ) from exc
     except SQLAlchemyError as exc:
         INGESTION_STAGES.labels("publish", "error", document_format).inc()
         try:
-            vector_store.delete_document(document_id)
-            document_repository.delete(document_id)
+            vector_store.delete_document(record.document_id)
+            document_repository.delete(record.document_id)
         except SQLAlchemyError:
             INGESTION_STAGES.labels("rollback", "error", document_format).inc()
         else:
@@ -362,24 +451,6 @@ async def upload_document(
         raise HTTPException(status_code=503, detail="Document repository is unavailable.") from exc
     INGESTION_STAGES.labels("publish", "success", document_format).inc()
     INGESTION_STAGES.labels("completed", "success", document_format).inc()
-    INGESTION_DURATION.labels(document_format).observe(time.perf_counter() - started)
-    INGESTED_CHUNKS.labels(document_format).observe(len(chunks))
-
-    DOCUMENT_UPLOADS.labels("indexed", document_format).inc()
-    return _upload_response(
-        DocumentRecord(
-            document_id=document_id,
-            filename=filename,
-            content_type=content_type or "application/octet-stream",
-            size_bytes=len(payload),
-            sha256=sha256,
-            uploaded_at=uploaded_at,
-            character_count=parsed.character_count,
-            chunks=tuple(chunks),
-            status="indexed",
-        ),
-        "indexed",
-    )
 
 
 def _upload_response(record: DocumentRecord, status_value: str) -> DocumentUploadResponse:
